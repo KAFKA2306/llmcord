@@ -3,6 +3,9 @@
 *
 
 !.gitignore
+!.python-version
+!pyproject.toml
+!uv.lock
 
 !*.md
 !*.py
@@ -10,4 +13,7 @@
 !Dockerfile
 !config.yaml
 !docker-compose.yaml
-!requirements.txt
+
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
