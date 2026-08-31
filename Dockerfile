@@ -1,13 +1,14 @@
 FROM python:3.13-slim
 
+COPY --from=ghcr.io/astral-sh/uv:0.12.7 /uv /uvx /bin/
+
 ARG DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
 
-COPY requirements.txt ./
-
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev
 
 COPY llmcord.py config.yaml ./
 
-CMD ["python", "llmcord.py"]
+CMD ["uv", "run", "--locked", "--no-sync", "python", "llmcord.py"]
