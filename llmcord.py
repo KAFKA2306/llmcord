@@ -309,107 +309,6 @@ async def on_message(new_msg: discord.Message) -> None:
         return
     extra_body = provider_extra_body | model_parameters or None
 
-    accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
-
-    max_text = config.get("max_text", 100000)
-    max_images = config.get("max_images", 5) if accept_images else 0
-    max_messages = config.get("max_messages", 25)
-
-    # Build message chain and set user warnings. With automatic context management enabled,
-    # reply-chain length is not the context-window authority; token-aware compaction handles it later.
-    messages = []
-    user_warnings = set()
-    curr_msg = new_msg
-
-    while curr_msg != None and (context_management_enabled or len(messages) < max_messages):
-        curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
-
-        async with curr_node.lock:
-            if curr_node.text == None:
-                cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).lstrip()
-
-                good_attachments = [att for att in curr_msg.attachments if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))]
-
-                attachment_responses = await asyncio.gather(*[httpx_client.get(att.url) for att in good_attachments])
-
-                curr_node.role = "assistant" if curr_msg.author == discord_bot.user else "user"
-
-                curr_node.text = "\n".join(
-                    ([cleaned_content] if cleaned_content else [])
-                    + ["\n".join(filter(None, (embed.title, embed.description, embed.footer.text))) for embed in curr_msg.embeds]
-                    + [component.content for component in curr_msg.components if component.type == discord.ComponentType.text_display]
-                    + [resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text")]
-                )
-
-                curr_node.images = [
-                    dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"))
-                    for att, resp in zip(good_attachments, attachment_responses)
-                    if att.content_type.startswith("image")
-                ]
-
-                if curr_node.role == "user" and (curr_node.text or curr_node.images):
-                    curr_node.text = f"<@{curr_msg.author.id}>: {curr_node.text}"
-
-                curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments)
-
-                try:
-                    if (
-                        curr_msg.reference == None
-                        and discord_bot.user.mention not in curr_msg.content
-                        and (prev_msg_in_channel := ([m async for m in curr_msg.channel.history(before=curr_msg, limit=1)] or [None])[0])
-                        and prev_msg_in_channel.type in (discord.MessageType.default, discord.MessageType.reply)
-                        and prev_msg_in_channel.author == (discord_bot.user if curr_msg.channel.type == discord.ChannelType.private else curr_msg.author)
-                    ):
-                        curr_node.parent_msg = prev_msg_in_channel
-                    else:
-                        is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
-                        parent_is_thread_start = is_public_thread and curr_msg.reference == None and curr_msg.channel.parent.type == discord.ChannelType.text
-
-                        if parent_msg_id := curr_msg.channel.id if parent_is_thread_start else getattr(curr_msg.reference, "message_id", None):
-                            if parent_is_thread_start:
-                                curr_node.parent_msg = curr_msg.channel.starter_message or await curr_msg.channel.parent.fetch_message(parent_msg_id)
-                            else:
-                                curr_node.parent_msg = curr_msg.reference.cached_message or await curr_msg.channel.fetch_message(parent_msg_id)
-
-                except (discord.NotFound, discord.HTTPException):
-                    logging.exception("Error fetching next message in the chain")
-                    curr_node.fetch_parent_failed = True
-
-            text = curr_node.text if context_management_enabled else curr_node.text[:max_text]
-            if curr_node.images[:max_images]:
-                content = [dict(type="text", text=text)] + curr_node.images[:max_images]
-            else:
-                content = text
-
-            if content != "":
-                messages.append(dict(content=content, role=curr_node.role))
-
-            if not context_management_enabled and len(curr_node.text) > max_text:
-                user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
-            if len(curr_node.images) > max_images:
-                user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
-            if curr_node.has_bad_attachments:
-                user_warnings.add("⚠️ Unsupported attachments")
-            if curr_node.fetch_parent_failed or (
-                not context_management_enabled and curr_node.parent_msg != None and len(messages) == max_messages
-            ):
-                user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
-
-            curr_msg = curr_node.parent_msg
-
-    logging.info(f"request_id={request_id} Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
-
-    if system_prompt := config.get("system_prompt"):
-        now = datetime.now().astimezone()
-
-        system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
-
-        messages.append(dict(role="system", content=system_prompt))
-
-    request_messages = messages[::-1]
-    managed_max_output_tokens = None
-    context_notice = None
-
     try:
         lease = await inference_gate.acquire()
     except InferenceQueueFull:
@@ -423,6 +322,107 @@ async def on_message(new_msg: discord.Message) -> None:
 
     logging.info("request_id=%s inference admitted queue_wait_seconds=%.3f", request_id, lease.queue_wait_seconds)
     try:
+        accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
+
+        max_text = config.get("max_text", 100000)
+        max_images = config.get("max_images", 5) if accept_images else 0
+        max_messages = config.get("max_messages", 25)
+
+        # Build message chain and set user warnings. With automatic context management enabled,
+        # reply-chain length is not the context-window authority; token-aware compaction handles it later.
+        messages = []
+        user_warnings = set()
+        curr_msg = new_msg
+
+        while curr_msg != None and (context_management_enabled or len(messages) < max_messages):
+            curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
+
+            async with curr_node.lock:
+                if curr_node.text == None:
+                    cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).lstrip()
+
+                    good_attachments = [att for att in curr_msg.attachments if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))]
+
+                    attachment_responses = await asyncio.gather(*[httpx_client.get(att.url) for att in good_attachments])
+
+                    curr_node.role = "assistant" if curr_msg.author == discord_bot.user else "user"
+
+                    curr_node.text = "\n".join(
+                        ([cleaned_content] if cleaned_content else [])
+                        + ["\n".join(filter(None, (embed.title, embed.description, embed.footer.text))) for embed in curr_msg.embeds]
+                        + [component.content for component in curr_msg.components if component.type == discord.ComponentType.text_display]
+                        + [resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text")]
+                    )
+
+                    curr_node.images = [
+                        dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"))
+                        for att, resp in zip(good_attachments, attachment_responses)
+                        if att.content_type.startswith("image")
+                    ]
+
+                    if curr_node.role == "user" and (curr_node.text or curr_node.images):
+                        curr_node.text = f"<@{curr_msg.author.id}>: {curr_node.text}"
+
+                    curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments)
+
+                    try:
+                        if (
+                            curr_msg.reference == None
+                            and discord_bot.user.mention not in curr_msg.content
+                            and (prev_msg_in_channel := ([m async for m in curr_msg.channel.history(before=curr_msg, limit=1)] or [None])[0])
+                            and prev_msg_in_channel.type in (discord.MessageType.default, discord.MessageType.reply)
+                            and prev_msg_in_channel.author == (discord_bot.user if curr_msg.channel.type == discord.ChannelType.private else curr_msg.author)
+                        ):
+                            curr_node.parent_msg = prev_msg_in_channel
+                        else:
+                            is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
+                            parent_is_thread_start = is_public_thread and curr_msg.reference == None and curr_msg.channel.parent.type == discord.ChannelType.text
+
+                            if parent_msg_id := curr_msg.channel.id if parent_is_thread_start else getattr(curr_msg.reference, "message_id", None):
+                                if parent_is_thread_start:
+                                    curr_node.parent_msg = curr_msg.channel.starter_message or await curr_msg.channel.parent.fetch_message(parent_msg_id)
+                                else:
+                                    curr_node.parent_msg = curr_msg.reference.cached_message or await curr_msg.channel.fetch_message(parent_msg_id)
+
+                    except (discord.NotFound, discord.HTTPException):
+                        logging.exception("Error fetching next message in the chain")
+                        curr_node.fetch_parent_failed = True
+
+                text = curr_node.text if context_management_enabled else curr_node.text[:max_text]
+                if curr_node.images[:max_images]:
+                    content = [dict(type="text", text=text)] + curr_node.images[:max_images]
+                else:
+                    content = text
+
+                if content != "":
+                    messages.append(dict(content=content, role=curr_node.role))
+
+                if not context_management_enabled and len(curr_node.text) > max_text:
+                    user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
+                if len(curr_node.images) > max_images:
+                    user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
+                if curr_node.has_bad_attachments:
+                    user_warnings.add("⚠️ Unsupported attachments")
+                if curr_node.fetch_parent_failed or (
+                    not context_management_enabled and curr_node.parent_msg != None and len(messages) == max_messages
+                ):
+                    user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
+
+                curr_msg = curr_node.parent_msg
+
+        logging.info(f"request_id={request_id} Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
+
+        if system_prompt := config.get("system_prompt"):
+            now = datetime.now().astimezone()
+
+            system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
+
+            messages.append(dict(role="system", content=system_prompt))
+
+        request_messages = messages[::-1]
+        managed_max_output_tokens = None
+        context_notice = None
+
         if context_management_enabled:
             try:
                 (
