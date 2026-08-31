@@ -32,3 +32,6 @@ jobs:
 
       - name: Compile
         run: uv run --locked --no-sync python -m py_compile llmcord.py
+
+      - name: Build Docker image
+        run: docker build -t llmcord:test .
