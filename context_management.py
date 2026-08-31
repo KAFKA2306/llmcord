@@ -37,6 +37,8 @@ class ContextPolicy:
     context_window_tokens: int
     max_output_tokens: int
     safety_margin_tokens: int
+    compaction_trigger_tokens: int
+    compaction_target_tokens: int
     recent_messages: int
     compaction_max_output_tokens: int
 
@@ -44,6 +46,8 @@ class ContextPolicy:
         positive = {
             "context_window_tokens": self.context_window_tokens,
             "max_output_tokens": self.max_output_tokens,
+            "compaction_trigger_tokens": self.compaction_trigger_tokens,
+            "compaction_target_tokens": self.compaction_target_tokens,
             "recent_messages": self.recent_messages,
             "compaction_max_output_tokens": self.compaction_max_output_tokens,
         }
@@ -56,6 +60,10 @@ class ContextPolicy:
             raise ContextManagementError("max_output_tokens + safety_margin_tokens must be smaller than context_window_tokens")
         if self.compaction_max_output_tokens + self.safety_margin_tokens >= self.context_window_tokens:
             raise ContextManagementError("compaction_max_output_tokens leaves no room for compaction input")
+        if self.compaction_trigger_tokens > self.hard_input_limit:
+            raise ContextManagementError("compaction_trigger_tokens must not exceed the hard input limit")
+        if self.compaction_target_tokens >= self.compaction_trigger_tokens:
+            raise ContextManagementError("compaction_target_tokens must be smaller than compaction_trigger_tokens")
 
     @property
     def hard_input_limit(self) -> int:
@@ -195,7 +203,7 @@ async def prepare_context(
     """
 
     before = await count_tokens(messages)
-    if before <= policy.hard_input_limit:
+    if before <= policy.compaction_trigger_tokens:
         return ContextResult(messages=list(messages), input_tokens_before=before, input_tokens_after=before)
 
     authority = [message for message in messages if _is_system(message)]
@@ -204,6 +212,8 @@ async def prepare_context(
         raise ContextManagementError("system/developer messages exceed the model context budget")
 
     # Prefer the configured recent window, but progressively compact older recent turns if required.
+    # The target keeps active context focused; the hard limit remains the final safety boundary.
+    best_safe: tuple[list[Message], int] | None = None
     for keep_count in range(min(policy.recent_messages, len(conversation)), 0, -1):
         older = conversation[:-keep_count]
         recent = conversation[-keep_count:]
@@ -218,12 +228,23 @@ async def prepare_context(
         ]
         after = await count_tokens(candidate)
         if after <= policy.hard_input_limit:
-            return ContextResult(
-                messages=candidate,
-                input_tokens_before=before,
-                input_tokens_after=after,
-                compacted=True,
-            )
+            best_safe = (candidate, after)
+            if after <= policy.compaction_target_tokens:
+                return ContextResult(
+                    messages=candidate,
+                    input_tokens_before=before,
+                    input_tokens_after=after,
+                    compacted=True,
+                )
+
+    if best_safe is not None:
+        candidate, after = best_safe
+        return ContextResult(
+            messages=candidate,
+            input_tokens_before=before,
+            input_tokens_after=after,
+            compacted=True,
+        )
 
     # At this point the system/developer authority plus the current message itself is too large.
     # Compact the current input automatically instead of assigning context management to the user.
