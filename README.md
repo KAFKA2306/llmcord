@@ -48,9 +48,10 @@ LLM API
 
 - Python が実行できる環境、または Docker
 - Discord Bot Token
-- Discord Application の Client ID
 - Discord Developer Portal で有効化した `MESSAGE CONTENT INTENT`
 - 使用する LLM の OpenAI 互換 API endpoint
+
+Discord Application の Client ID は、起動時に Bot 招待 URL をログへ表示したい場合に設定します。
 
 ## セットアップ
 
@@ -65,7 +66,7 @@ cd llmcord
 
 [Discord Developer Portal](https://discord.com/developers/applications) で Application と Bot を作成します。
 
-Bot の設定で `MESSAGE CONTENT INTENT` を有効にし、Token と Client ID を環境変数へ設定します。
+Bot の設定で `MESSAGE CONTENT INTENT` を有効にし、Token を環境変数へ設定します。Client ID も使う場合は同様に設定します。
 
 ```bash
 export DISCORD_BOT_TOKEN='...'
@@ -178,14 +179,16 @@ Bot の返答へ返信すると、その返信チェーンを会話履歴とし�
 | 設定 | 内容 | 既定値 |
 | --- | --- | --- |
 | `bot_token` | Discord Bot Token | 必須 |
-| `client_id` | Discord Application Client ID | 未設定 |
-| `status_message` | Bot のステータスメッセージ。最大128文字 | 未設定 |
+| `client_id` | Discord Application Client ID。招待 URL のログ表示に使用 | 未設定 |
+| `status_message` | Bot のステータスメッセージ。最大128文字 | 空欄 |
 | `max_text` | 1メッセージから LLM へ渡す最大文字数。テキスト添付を含む | `100000` |
 | `max_images` | 1メッセージから渡す最大画像数 | `5` |
 | `max_messages` | 返信チェーンから使用する最大メッセージ数 | `25` |
 | `use_plain_responses` | Embed ではなく plaintext component を使う | `false` |
 | `allow_dms` | DM を許可する | `true` |
 | `permissions` | user / role / channel ごとの許可・拒否 | 全許可相当 |
+
+`status_message` が空の場合、現行コードは upstream の GitHub URL をステータスへ表示します。
 
 `allowed_ids` が空の場合、その分類では allowlist 制限を行いません。`blocked_ids` は拒否対象です。`admin_ids` のユーザーは `/model` を使用できます。
 
@@ -257,7 +260,6 @@ llmcord.py           Discord Bot 本体
 config.yaml          実行設定と provider / model 定義
 requirements.txt     Python 依存関係
 Dockerfile           コンテナイメージ
-Dockerfile           
 docker-compose.yaml  Compose 実行設定
 LICENSE.md            MIT License
 README.md             この文書
