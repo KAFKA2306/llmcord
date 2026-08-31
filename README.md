@@ -1,115 +1,272 @@
-<h1 align="center">
-  llmcord
-</h1>
+# llmcord
 
-<h3 align="center"><i>
-  Talk to LLMs with your friends!
-</i></h3>
+Discord を OpenAI `/v1/chat/completions` 互換 LLM のフロントエンドとして使う Bot です。ローカル LLM とリモート LLM の両方を扱えます。
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/7791cc6b-6755-484f-a9e3-0707765b081f" alt="">
-</p>
+## このリポジトリについて
 
-llmcord transforms Discord into a collaborative LLM frontend. It works with practically any LLM, remote or locally hosted.
+このリポジトリは `KAFKA2306/llmcord` として運用しています。元の実装は [jakobdylanc/llmcord](https://github.com/jakobdylanc/llmcord) です。ライセンスは MIT です。
 
-## Features
+長時間の無人運用に必要な timeout、bounded queue、実生成 probe、watchdog、GPU 状態確認などの安定化は [Issue #1](https://github.com/KAFKA2306/llmcord/issues/1) で管理しています。現行コードにはこれらの仕組みがまだすべて実装されているわけではありません。
 
-### Reply-based conversations:
-Just @ the bot to start a conversation and reply to continue. Build conversations with reply chains!
+## 主な機能
 
-The reply chain is the conversation history, stored entirely in Discord. No database required.
+- Discord のメンション、返信、DM から LLM と会話
+- 返信チェーンを会話履歴として利用し、会話用データベースは不要
+- スレッド内の会話に対応
+- `/model` で管理者がモデルを切り替え
+- OpenAI `/v1/chat/completions` 互換 API に対応
+- OpenRouter、OpenAI、xAI、Google、Azure OpenAI の設定例を同梱
+- Ollama、LM Studio、vLLM のローカル API 設定例を同梱
+- テキストファイル添付に対応
+- 対応モデルでは画像添付に対応
+- 応答をストリーミング表示し、長文は複数メッセージへ分割
+- `config.yaml` をモデル選択時やメッセージ処理時に再読込
+- ユーザー、ロール、チャンネル単位のアクセス制御
+- `asyncio` と非同期 HTTP クライアントを使用
 
-You can:
-- Branch conversations endlessly
-- Continue other people's conversations
-- @ the bot while replying to ANY message to include it in the conversation
+## 構成
 
-Additionally:
-- When DMing the bot, conversations continue automatically (no reply required). To start a fresh conversation, just @ the bot. You can still reply to continue from anywhere.
-- You can branch conversations into [threads](https://support.discord.com/hc/en-us/articles/4403205878423-Threads-FAQ). Just create a thread from any message and @ the bot inside to continue.
-- Back-to-back messages from the same user are automatically chained together. Just reply to the latest one and the bot will see all of them.
+```text
+Discord
+  |
+  v
+llmcord.py
+  |
+  | OpenAI /v1/chat/completions
+  v
+LLM API
+  |- Ollama
+  |- LM Studio
+  |- vLLM
+  |- その他の OpenAI 互換 API
+  `- リモート LLM API
+```
 
----
+会話履歴は Discord の返信関係から再構築します。Bot 側に会話データベースはありません。
 
-### Model switching with `/model`:
-![image](https://github.com/user-attachments/assets/568e2f5c-bf32-4b77-ab57-198d9120f3d2)
+## 必要なもの
 
-llmcord supports remote models from:
-- [OpenRouter](https://openrouter.ai/models)
-- [OpenAI](https://platform.openai.com/docs/models)
-- [xAI](https://docs.x.ai/docs/models)
-- [Google](https://ai.google.dev/gemini-api/docs/models)
+- Python が実行できる環境、または Docker
+- Discord Bot Token
+- Discord Application の Client ID
+- Discord Developer Portal で有効化した `MESSAGE CONTENT INTENT`
+- 使用する LLM の OpenAI 互換 API endpoint
 
-Or run local models with:
-- [LM Studio](https://lmstudio.ai)
-- [Ollama](https://ollama.com)
-- [vLLM](https://github.com/vllm-project/vllm)
+## セットアップ
 
-...Or use any other OpenAI /v1/chat/completions compatible API server.
+### 1. Clone
 
----
+```bash
+git clone https://github.com/KAFKA2306/llmcord.git
+cd llmcord
+```
 
-### And more:
-- Supports image attachments when using a vision model (like gpt-5, grok-4, claude-4, etc.)
-- Supports text file attachments (.txt, .py, .c, etc.)
-- Customizable personality (aka system prompt)
-- Distinguishes users via their Discord IDs
-- Streamed responses (turns green when complete, automatically splits into separate messages when too long)
-- Hot reloading config (you can change settings without restarting the bot)
-- Displays helpful warnings when appropriate (like "⚠️ Only using last 25 messages" when the customizable message limit is exceeded)
-- Caches message data in a size-managed (no memory leaks) and mutex-protected (no race conditions) global dictionary to maximize efficiency and minimize Discord API calls
-- Fully asynchronous
-- 1 Python file, ~300 lines of code
+### 2. Discord Bot を設定
 
-## Instructions
+[Discord Developer Portal](https://discord.com/developers/applications) で Application と Bot を作成します。
 
-1. Clone the repo:
-   ```bash
-   git clone https://github.com/jakobdylanc/llmcord
-   cd llmcord
-   ```
+Bot の設定で `MESSAGE CONTENT INTENT` を有効にし、Token と Client ID を環境変数へ設定します。
 
-2. Set up `config.yaml`:
+```bash
+export DISCORD_BOT_TOKEN='...'
+export DISCORD_CLIENT_ID='...'
+```
 
-> Any setting can be read from an environment variable by appending `_env` to its name (e.g. `bot_token_env: DISCORD_BOT_TOKEN`).
+`.env` を使う場合も同じ変数名を使用できます。
 
-### Discord settings:
+```dotenv
+DISCORD_BOT_TOKEN=...
+DISCORD_CLIENT_ID=...
+```
 
-| Setting | Description |
+Token を `config.yaml` や Git 管理対象ファイルへ直接書かないでください。
+
+### 3. LLM を設定
+
+`config.yaml` の `providers` と `models` を使用します。
+
+設定名の末尾を `_env` にすると、その値を名前とする環境変数から読み込みます。
+
+```yaml
+bot_token_env: DISCORD_BOT_TOKEN
+client_id_env: DISCORD_CLIENT_ID
+```
+
+ローカル LLM の既定設定例は次のとおりです。
+
+```yaml
+providers:
+  lmstudio:
+    base_url: http://localhost:1234/v1
+
+  ollama:
+    base_url: http://localhost:11434/v1
+
+  vllm:
+    base_url: http://localhost:8000/v1
+```
+
+モデルは `<provider>/<model>` 形式で登録します。
+
+```yaml
+models:
+  ollama/llama4:
+```
+
+`providers` に任意の OpenAI `/v1/chat/completions` 互換 API を追加することもできます。
+
+```yaml
+providers:
+  local:
+    base_url: http://127.0.0.1:8080/v1
+
+models:
+  local/<APIが受け付けるモデル名>:
+```
+
+`models` の先頭が起動時の既定モデルです。
+
+### 4. 起動
+
+Python で直接起動する場合:
+
+```bash
+python -m pip install -U -r requirements.txt
+python llmcord.py
+```
+
+Docker Compose を使う場合:
+
+```bash
+docker compose up --build
+```
+
+現行 `docker-compose.yaml` は `network_mode: host` と `restart: unless-stopped` を使用します。ローカル LLM へ接続できない場合は、llmcord を実行している環境から `base_url` へ実際に到達できるか確認してください。
+
+## Discord 側の使い方
+
+### サーバー
+
+Bot をメンションすると新しい会話を開始します。
+
+```text
+@bot 質問
+```
+
+Bot の返答へ返信すると、その返信チェーンを会話履歴として続行します。任意のメッセージへ返信しながら Bot をメンションすると、そのメッセージから会話を開始できます。
+
+### DM
+
+`allow_dms: true` の場合、DM では毎回メンションしなくても会話が継続します。新しい会話を開始したい場合は Bot をメンションします。
+
+### スレッド
+
+既存メッセージから Discord スレッドを作成し、スレッド内で Bot をメンションすると会話を続けられます。
+
+### モデル切り替え
+
+```text
+/model
+```
+
+`permissions.users.admin_ids` に登録したユーザーだけがモデルを変更できます。
+
+## 設定
+
+### Discord
+
+| 設定 | 内容 | 既定値 |
+| --- | --- | --- |
+| `bot_token` | Discord Bot Token | 必須 |
+| `client_id` | Discord Application Client ID | 未設定 |
+| `status_message` | Bot のステータスメッセージ。最大128文字 | 未設定 |
+| `max_text` | 1メッセージから LLM へ渡す最大文字数。テキスト添付を含む | `100000` |
+| `max_images` | 1メッセージから渡す最大画像数 | `5` |
+| `max_messages` | 返信チェーンから使用する最大メッセージ数 | `25` |
+| `use_plain_responses` | Embed ではなく plaintext component を使う | `false` |
+| `allow_dms` | DM を許可する | `true` |
+| `permissions` | user / role / channel ごとの許可・拒否 | 全許可相当 |
+
+`allowed_ids` が空の場合、その分類では allowlist 制限を行いません。`blocked_ids` は拒否対象です。`admin_ids` のユーザーは `/model` を使用できます。
+
+### LLM
+
+| 設定 | 内容 |
 | --- | --- |
-| **bot_token** | Create a new Discord bot at [discord.com/developers/applications](https://discord.com/developers/applications) and generate a token under the "Bot" tab. Also enable "MESSAGE CONTENT INTENT". |
-| **client_id** | Found under the "OAuth2" tab of the Discord bot you just made. |
-| **status_message** | Set a custom message that displays on the bot's Discord profile.<br /><br />**Max 128 characters.** |
-| **max_text** | The maximum amount of text allowed in a single message, including text from file attachments.<br /><br />Default: `100,000` |
-| **max_images** | The maximum number of image attachments allowed in a single message.<br /><br />Default: `5`<br /><br />**Only applicable when using a vision model.** |
-| **max_messages** | The maximum number of messages allowed in a reply chain. When exceeded, the oldest messages are dropped.<br /><br />Default: `25` |
-| **use_plain_responses** | When set to `true` the bot will use plaintext responses instead of embeds. Plaintext responses have a shorter character limit so the bot's messages may split more often.<br /><br />Default: `false`<br /><br />**Also disables streamed responses and warning messages.** |
-| **allow_dms** | Set to `false` to disable direct message access.<br /><br />Default: `true` |
-| **permissions** | Configure access permissions for `users`, `roles` and `channels`, each with a list of `allowed_ids` and `blocked_ids`.<br /><br />Control which `users` are admins with `admin_ids`. Admins can change the model with `/model` and DM the bot even if `allow_dms` is `false`.<br /><br />**Leave `allowed_ids` empty to allow ALL in that category.**<br /><br />**Role and channel permissions do not affect DMs.**<br /><br />**You can use [category](https://support.discord.com/hc/en-us/articles/115001580171-Channel-Categories-101) IDs to control channel permissions in groups.** |
+| `providers` | provider 名ごとの `base_url`、`api_key`、追加 HTTP 設定 |
+| `models` | `<provider>/<model>` ごとのモデル設定 |
+| `system_prompt` | 全会話へ追加する system prompt |
 
-### LLM settings:
+provider では必要に応じて次の項目を使用できます。
 
-| Setting | Description |
-| --- | --- |
-| **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. Popular providers (`openrouter`, `openai`, `ollama`, etc.) are already included.<br /><br />**Only supports OpenAI /v1/chat/completions compatible APIs.**<br /><br />**Some providers may need `extra_headers` / `extra_query` / `extra_body` entries for extra HTTP data. See the included `azure-openai` provider for an example.** |
-| **models** | Add the models you want to use in `<provider>/<model>: <parameters>` format (examples are included). When you run `/model` these models will show up as autocomplete suggestions.<br /><br />**Refer to each provider's documentation for supported parameters.**<br /><br />**The first model in your `models` list will be the default model at startup.**<br /><br />**Some vision models may need `:vision` added to the end of their name to enable image support.** |
-| **system_prompt** | Write anything you want to customize the bot's behavior!<br /><br />**Leave blank for no system prompt.**<br /><br />**You can use the `{date}` and `{time}` tags in your system prompt to insert the current date and time, based on your host computer's time zone.**<br /><br />**It is recommended to include something like `"User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users."` in your system prompt to help the bot understand the user message format.** |
+- `api_key` / `api_key_env`
+- `extra_headers`
+- `extra_query`
+- `extra_body`
 
-3. Run the bot:
+モデル側へ設定した値は request の追加 body として送られます。
 
-   **No Docker:**
-   ```bash
-   python -m pip install -U -r requirements.txt
-   python llmcord.py
-   ```
+`system_prompt` では `{date}` と `{time}` を使用でき、ホストのローカル時刻で置換されます。
 
-   **With Docker:**
-   ```bash
-   docker compose up
-   ```
+## 画像と添付ファイル
 
-## Notes
+テキストまたは画像として認識された添付ファイルだけを処理します。
 
-- If you're having issues, try my suggestions [here](https://github.com/jakobdylanc/llmcord/issues/19)
+画像入力はモデル名から vision 対応を推定します。必要な場合はモデル名の末尾へ `:vision` を付けることで画像入力を有効にできます。
 
-- PRs are welcome :)
+上限を超えた入力や未対応添付がある場合は、通常の Embed 応答では警告を表示します。
+
+## 現行実装の運用上の注意
+
+現時点のコードは通常の対話用途を中心とした構成です。Local LLM を長期間無人運用する場合、次の機能はまだ production contract として確立されていません。
+
+- LLM request の明示的な有限 timeout
+- GPU inference の bounded queue
+- 同時生成数の強制上限
+- generation path を通す synthetic health probe
+- backend freeze 時の deterministic watchdog
+- restart storm 防止
+- GPU 消失や CPU fallback の異常判定
+- request_id を使った end-to-end の追跡
+
+これらは [Issue #1](https://github.com/KAFKA2306/llmcord/issues/1) で実装・検証します。
+
+また、既定の `max_text: 100000` と `max_messages: 25` はすべての Local LLM に安全な値ではありません。実際の context length と VRAM に合わせて制限してください。
+
+## トラブルシュート
+
+Bot がメッセージを読まない場合:
+
+1. Discord Developer Portal で `MESSAGE CONTENT INTENT` が有効か確認する
+2. サーバーでは Bot をメンションしているか確認する
+3. `permissions` の allowlist / blocklist を確認する
+
+LLM に接続できない場合:
+
+1. `providers.<name>.base_url` を確認する
+2. llmcord の実行環境から endpoint へ到達できるか確認する
+3. `<provider>/<model>` の provider 名が `providers` に存在するか確認する
+4. API key が必要な provider では環境変数が設定されているか確認する
+
+生成中の例外は現在ログへ記録されます。無人運用での自動復旧は Issue #1 の対象です。
+
+## ファイル
+
+```text
+llmcord.py           Discord Bot 本体
+config.yaml          実行設定と provider / model 定義
+requirements.txt     Python 依存関係
+Dockerfile           コンテナイメージ
+Dockerfile           
+docker-compose.yaml  Compose 実行設定
+LICENSE.md            MIT License
+README.md             この文書
+```
+
+## Upstream / License
+
+元のプロジェクト:
+
+https://github.com/jakobdylanc/llmcord
+
+MIT License。著作権表示とライセンス本文は `LICENSE.md` を参照してください。
