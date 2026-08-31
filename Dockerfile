@@ -6,9 +6,9 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
 
-COPY pyproject.toml ./
-RUN uv sync --no-dev
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev
 
 COPY llmcord.py config.yaml ./
 
-CMD ["uv", "run", "--no-sync", "python", "llmcord.py"]
+CMD ["uv", "run", "--locked", "--no-sync", "python", "llmcord.py"]
