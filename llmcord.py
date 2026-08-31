@@ -12,7 +12,7 @@ from discord.ext import commands
 from discord.ui import LayoutView, TextDisplay
 from dotenv import load_dotenv
 import httpx
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, OpenAIError
 import yaml
 
 from context_management import ContextManagementError, ContextPolicy, compaction_request_messages, prepare_context
@@ -62,7 +62,14 @@ async def prepare_managed_context(
     extra_headers: Optional[dict[str, str]],
     extra_query: Optional[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], bool, bool, int, int, int]:
-    required = ("max_output_tokens", "safety_margin_tokens", "recent_messages", "compaction_max_output_tokens")
+    required = (
+        "max_output_tokens",
+        "safety_margin_tokens",
+        "compaction_trigger_tokens",
+        "compaction_target_tokens",
+        "recent_messages",
+        "compaction_max_output_tokens",
+    )
     missing = [name for name in required if name not in context_config]
     if missing:
         raise ContextManagementError(f"missing context_management setting(s): {', '.join(missing)}")
@@ -90,6 +97,8 @@ async def prepare_managed_context(
         context_window_tokens=context_window_tokens,
         max_output_tokens=context_config["max_output_tokens"],
         safety_margin_tokens=context_config["safety_margin_tokens"],
+        compaction_trigger_tokens=context_config["compaction_trigger_tokens"],
+        compaction_target_tokens=context_config["compaction_target_tokens"],
         recent_messages=context_config["recent_messages"],
         compaction_max_output_tokens=context_config["compaction_max_output_tokens"],
     )
@@ -110,11 +119,9 @@ async def prepare_managed_context(
         except (KeyError, TypeError, ValueError) as exc:
             raise ContextManagementError(f"token count response from {token_count_url} has no integer input_tokens") from exc
 
-    compaction_model = context_config.get("compaction_model", model)
-
     async def compact(history: list[dict[str, Any]], max_output_tokens: int) -> str:
         response = await openai_client.chat.completions.create(
-            model=compaction_model,
+            model=model,
             messages=compaction_request_messages(history),
             max_tokens=max_output_tokens,
             temperature=0,
@@ -258,7 +265,18 @@ async def on_message(new_msg: discord.Message) -> None:
 
     extra_headers = provider_config.get("extra_headers")
     extra_query = provider_config.get("extra_query")
-    extra_body = (provider_config.get("extra_body") or {}) | model_parameters or None
+    provider_extra_body = provider_config.get("extra_body") or {}
+    if context_management_enabled and any(
+        key in provider_extra_body or key in model_parameters
+        for key in ("max_tokens", "max_completion_tokens")
+    ):
+        logging.error("output token limit for %s must be owned by context_management.max_output_tokens", provider_slash_model)
+        await new_msg.reply(
+            "⚠️ Context management is misconfigured: set the output limit only in context_management.max_output_tokens.",
+            silent=True,
+        )
+        return
+    extra_body = provider_extra_body | model_parameters or None
 
     accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
 
@@ -359,6 +377,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
     request_messages = messages[::-1]
     managed_max_output_tokens = None
+    context_notice = None
 
     if context_management_enabled:
         try:
@@ -380,7 +399,7 @@ async def on_message(new_msg: discord.Message) -> None:
                 extra_headers=extra_headers,
                 extra_query=extra_query,
             )
-        except (ContextManagementError, httpx.HTTPError) as exc:
+        except (ContextManagementError, httpx.HTTPError, OpenAIError) as exc:
             logging.exception("Context management failed")
             await new_msg.reply(
                 f"⚠️ Context management could not safely prepare this request. The request was not sent. ({type(exc).__name__})",
@@ -389,7 +408,8 @@ async def on_message(new_msg: discord.Message) -> None:
             return
 
         if compacted:
-            user_warnings.add("ℹ️ Long conversation history was automatically compacted")
+            context_notice = "ℹ️ Long conversation history was automatically compacted"
+            user_warnings.add(context_notice)
             logging.info(
                 "Context compacted (input tokens: %s -> %s, current input compacted: %s)",
                 input_tokens_before,
@@ -465,7 +485,9 @@ async def on_message(new_msg: discord.Message) -> None:
                         last_task_time = datetime.now().timestamp()
 
             if use_plain_responses:
-                for content in response_contents:
+                for index, content in enumerate(response_contents):
+                    if index == 0 and context_notice:
+                        content = f"{context_notice}\n\n{content}"
                     await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
 
     except Exception:
