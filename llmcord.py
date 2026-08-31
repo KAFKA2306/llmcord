@@ -15,6 +15,8 @@ import httpx
 from openai import AsyncOpenAI
 import yaml
 
+from context_management import ContextManagementError, ContextPolicy, compaction_request_messages, prepare_context
+
 load_dotenv()
 
 logging.basicConfig(
@@ -42,6 +44,97 @@ def resolve_env(node: Any) -> Any:
 def get_config(filename: str = "config.yaml") -> dict[str, Any]:
     with open(filename, encoding="utf-8") as file:
         return resolve_env(yaml.safe_load(file))
+
+
+def _request_headers(api_key: str, extra_headers: Optional[dict[str, str]]) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}", **(extra_headers or {})}
+
+
+async def prepare_managed_context(
+    *,
+    messages: list[dict[str, Any]],
+    context_config: dict[str, Any],
+    http_client: httpx.AsyncClient,
+    openai_client: AsyncOpenAI,
+    base_url: str,
+    api_key: str,
+    model: str,
+    extra_headers: Optional[dict[str, str]],
+    extra_query: Optional[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool, bool, int, int, int]:
+    required = ("max_output_tokens", "safety_margin_tokens", "recent_messages", "compaction_max_output_tokens")
+    missing = [name for name in required if name not in context_config]
+    if missing:
+        raise ContextManagementError(f"missing context_management setting(s): {', '.join(missing)}")
+
+    configured_window = context_config.get("context_window_tokens", "auto")
+    if configured_window == "auto":
+        props_url = context_config.get("props_url") or f"{base_url.removesuffix('/v1')}/props"
+        props_response = await http_client.get(
+            props_url,
+            headers=_request_headers(api_key, extra_headers),
+            params={"model": model},
+        )
+        props_response.raise_for_status()
+        props = props_response.json()
+        try:
+            context_window_tokens = int(props["default_generation_settings"]["n_ctx"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ContextManagementError(f"runtime context window is unavailable from {props_url}") from exc
+    elif isinstance(configured_window, int) and not isinstance(configured_window, bool):
+        context_window_tokens = configured_window
+    else:
+        raise ContextManagementError("context_window_tokens must be a positive integer or 'auto'")
+
+    policy = ContextPolicy(
+        context_window_tokens=context_window_tokens,
+        max_output_tokens=context_config["max_output_tokens"],
+        safety_margin_tokens=context_config["safety_margin_tokens"],
+        recent_messages=context_config["recent_messages"],
+        compaction_max_output_tokens=context_config["compaction_max_output_tokens"],
+    )
+
+    token_count_url = context_config.get("token_count_url") or f"{base_url.rstrip('/')}/chat/completions/input_tokens"
+
+    async def count_tokens(candidate_messages: list[dict[str, Any]]) -> int:
+        response = await http_client.post(
+            token_count_url,
+            headers=_request_headers(api_key, extra_headers),
+            params=extra_query,
+            json={"model": model, "messages": candidate_messages},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        try:
+            return int(payload["input_tokens"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ContextManagementError(f"token count response from {token_count_url} has no integer input_tokens") from exc
+
+    compaction_model = context_config.get("compaction_model", model)
+
+    async def compact(history: list[dict[str, Any]], max_output_tokens: int) -> str:
+        response = await openai_client.chat.completions.create(
+            model=compaction_model,
+            messages=compaction_request_messages(history),
+            max_tokens=max_output_tokens,
+            temperature=0,
+            stream=False,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+        )
+        if not response.choices or not response.choices[0].message.content:
+            raise ContextManagementError("compaction model returned no summary")
+        return response.choices[0].message.content
+
+    result = await prepare_context(messages, policy, count_tokens, compact)
+    return (
+        result.messages,
+        result.compacted,
+        result.compacted_current_input,
+        result.input_tokens_before,
+        result.input_tokens_after,
+        policy.max_output_tokens,
+    )
 
 
 config = get_config()
@@ -155,11 +248,17 @@ async def on_message(new_msg: discord.Message) -> None:
     api_key = provider_config.get("api_key", "sk-no-key-required")
     openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
-    model_parameters = config["models"].get(provider_slash_model, None)
+    model_parameters = dict(config["models"].get(provider_slash_model) or {})
+    context_config = model_parameters.pop("context_management", None)
+    if context_config is not None and not isinstance(context_config, dict):
+        logging.error("context_management for %s must be a mapping", provider_slash_model)
+        await new_msg.reply("⚠️ Context management is misconfigured. The request was not sent.", silent=True)
+        return
+    context_management_enabled = bool(context_config is not None and context_config.get("enabled", True))
 
     extra_headers = provider_config.get("extra_headers")
     extra_query = provider_config.get("extra_query")
-    extra_body = (provider_config.get("extra_body") or {}) | (model_parameters or {}) or None
+    extra_body = (provider_config.get("extra_body") or {}) | model_parameters or None
 
     accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
 
@@ -167,12 +266,13 @@ async def on_message(new_msg: discord.Message) -> None:
     max_images = config.get("max_images", 5) if accept_images else 0
     max_messages = config.get("max_messages", 25)
 
-    # Build message chain and set user warnings
+    # Build message chain and set user warnings. With automatic context management enabled,
+    # reply-chain length is not the context-window authority; token-aware compaction handles it later.
     messages = []
     user_warnings = set()
     curr_msg = new_msg
 
-    while curr_msg != None and len(messages) < max_messages:
+    while curr_msg != None and (context_management_enabled or len(messages) < max_messages):
         curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
 
         async with curr_node.lock:
@@ -226,21 +326,24 @@ async def on_message(new_msg: discord.Message) -> None:
                     logging.exception("Error fetching next message in the chain")
                     curr_node.fetch_parent_failed = True
 
+            text = curr_node.text if context_management_enabled else curr_node.text[:max_text]
             if curr_node.images[:max_images]:
-                content = [dict(type="text", text=curr_node.text[:max_text])] + curr_node.images[:max_images]
+                content = [dict(type="text", text=text)] + curr_node.images[:max_images]
             else:
-                content = curr_node.text[:max_text]
+                content = text
 
             if content != "":
                 messages.append(dict(content=content, role=curr_node.role))
 
-            if len(curr_node.text) > max_text:
+            if not context_management_enabled and len(curr_node.text) > max_text:
                 user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
             if len(curr_node.images) > max_images:
                 user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
             if curr_node.has_bad_attachments:
                 user_warnings.add("⚠️ Unsupported attachments")
-            if curr_node.fetch_parent_failed or (curr_node.parent_msg != None and len(messages) == max_messages):
+            if curr_node.fetch_parent_failed or (
+                not context_management_enabled and curr_node.parent_msg != None and len(messages) == max_messages
+            ):
                 user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
 
             curr_msg = curr_node.parent_msg
@@ -254,12 +357,54 @@ async def on_message(new_msg: discord.Message) -> None:
 
         messages.append(dict(role="system", content=system_prompt))
 
+    request_messages = messages[::-1]
+    managed_max_output_tokens = None
+
+    if context_management_enabled:
+        try:
+            (
+                request_messages,
+                compacted,
+                compacted_current_input,
+                input_tokens_before,
+                input_tokens_after,
+                managed_max_output_tokens,
+            ) = await prepare_managed_context(
+                messages=request_messages,
+                context_config=context_config,
+                http_client=httpx_client,
+                openai_client=openai_client,
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            )
+        except (ContextManagementError, httpx.HTTPError) as exc:
+            logging.exception("Context management failed")
+            await new_msg.reply(
+                f"⚠️ Context management could not safely prepare this request. The request was not sent. ({type(exc).__name__})",
+                silent=True,
+            )
+            return
+
+        if compacted:
+            user_warnings.add("ℹ️ Long conversation history was automatically compacted")
+            logging.info(
+                "Context compacted (input tokens: %s -> %s, current input compacted: %s)",
+                input_tokens_before,
+                input_tokens_after,
+                compacted_current_input,
+            )
+
     # Generate and send response message(s) (can be multiple if response is long)
     curr_content = finish_reason = None
     response_msgs = []
     response_contents = []
 
-    openai_kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
+    openai_kwargs = dict(model=model, messages=request_messages, stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
+    if managed_max_output_tokens is not None:
+        openai_kwargs["max_tokens"] = managed_max_output_tokens
 
     if use_plain_responses := config.get("use_plain_responses", False):
         max_message_length = 4000
