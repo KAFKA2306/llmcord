@@ -9,6 +9,16 @@ max_text: 100000
 max_images: 5
 max_messages: 25
 
+# Process-level inference admission and deadlines. These values are an explicit
+# operational policy, not model-context guesses. Change them intentionally for the deployment.
+runtime_control:
+  max_concurrency: 1
+  max_queue_size: 4
+  queue_wait_timeout_seconds: 300
+  connect_timeout_seconds: 10
+  first_token_timeout_seconds: 300
+  total_generation_timeout_seconds: 1800
+
 use_plain_responses: false
 allow_dms: true
 
