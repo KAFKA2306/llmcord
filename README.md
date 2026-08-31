@@ -46,10 +46,12 @@ LLM API
 
 ## 必要なもの
 
-- Python が実行できる環境、または Docker
+- [uv](https://docs.astral.sh/uv/)
 - Discord Bot Token
 - Discord Developer Portal で有効化した `MESSAGE CONTENT INTENT`
 - 使用する LLM の OpenAI 互換 API endpoint
+
+Python は `.python-version` と `pyproject.toml` に従って uv が管理します。現行の対象は Python 3.13 です。
 
 Discord Application の Client ID は、起動時に Bot 招待 URL をログへ表示したい場合に設定します。
 
@@ -62,7 +64,24 @@ git clone https://github.com/KAFKA2306/llmcord.git
 cd llmcord
 ```
 
-### 2. Discord Bot を設定
+### 2. 依存関係を同期
+
+```bash
+uv sync --locked
+```
+
+依存関係の正本は `pyproject.toml`、固定解は `uv.lock` です。`pip install` や `requirements.txt` は使用しません。
+
+依存関係を変更する場合は uv 経由で更新します。
+
+```bash
+uv add <package>
+uv remove <package>
+```
+
+`pyproject.toml` と `uv.lock` を同じ変更としてコミットしてください。
+
+### 3. Discord Bot を設定
 
 [Discord Developer Portal](https://discord.com/developers/applications) で Application と Bot を作成します。
 
@@ -82,7 +101,7 @@ DISCORD_CLIENT_ID=...
 
 Token を `config.yaml` や Git 管理対象ファイルへ直接書かないでください。
 
-### 3. LLM を設定
+### 4. LLM を設定
 
 `config.yaml` の `providers` と `models` を使用します。
 
@@ -127,13 +146,10 @@ models:
 
 `models` の先頭が起動時の既定モデルです。
 
-### 4. 起動
-
-Python で直接起動する場合:
+### 5. 起動
 
 ```bash
-python -m pip install -U -r requirements.txt
-python llmcord.py
+uv run python llmcord.py
 ```
 
 Docker Compose を使う場合:
@@ -142,7 +158,7 @@ Docker Compose を使う場合:
 docker compose up --build
 ```
 
-現行 `docker-compose.yaml` は `network_mode: host` と `restart: unless-stopped` を使用します。ローカル LLM へ接続できない場合は、llmcord を実行している環境から `base_url` へ実際に到達できるか確認してください。
+Docker image 内でも uv を使用します。現行 `docker-compose.yaml` は `network_mode: host` と `restart: unless-stopped` を使用します。ローカル LLM へ接続できない場合は、llmcord を実行している環境から `base_url` へ実際に到達できるか確認してください。
 
 ## Discord 側の使い方
 
@@ -258,11 +274,14 @@ LLM に接続できない場合:
 ```text
 llmcord.py           Discord Bot 本体
 config.yaml          実行設定と provider / model 定義
-requirements.txt     Python 依存関係
-Dockerfile           コンテナイメージ
-docker-compose.yaml  Compose 実行設定
-LICENSE.md            MIT License
-README.md             この文書
+pyproject.toml        Python / uv / 直接依存の正本
+uv.lock               解決済み依存バージョン
+.python-version       uv が使用する Python 系列
+Dockerfile            uv ベースのコンテナイメージ
+docker-compose.yaml   Compose 実行設定
+.github/workflows/     CI
+LICENSE.md             MIT License
+README.md              この文書
 ```
 
 ## Upstream / License
