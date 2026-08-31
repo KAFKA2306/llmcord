@@ -2,292 +2,205 @@
 
 Discord を OpenAI `/v1/chat/completions` 互換 LLM のフロントエンドとして使う Bot です。ローカル LLM とリモート LLM の両方を扱えます。
 
-## このリポジトリについて
+元実装: https://github.com/jakobdylanc/llmcord
 
-このリポジトリは `KAFKA2306/llmcord` として運用しています。元の実装は [jakobdylanc/llmcord](https://github.com/jakobdylanc/llmcord) です。ライセンスは MIT です。
+長時間の無人運用に必要な残作業は https://github.com/KAFKA2306/llmcord/issues/1 で管理しています。
 
-長時間の無人運用に必要な timeout、bounded queue、実生成 probe、watchdog、GPU 状態確認などの安定化は [Issue #1](https://github.com/KAFKA2306/llmcord/issues/1) で管理しています。現行コードにはこれらの仕組みがまだすべて実装されているわけではありません。
-
-## 主な機能
-
-- Discord のメンション、返信、DM から LLM と会話
-- 返信チェーンを会話履歴として利用し、会話用データベースは不要
-- スレッド内の会話に対応
-- `/model` で管理者がモデルを切り替え
-- OpenAI `/v1/chat/completions` 互換 API に対応
-- OpenRouter、OpenAI、xAI、Google、Azure OpenAI の設定例を同梱
-- Ollama、LM Studio、vLLM のローカル API 設定例を同梱
-- テキストファイル添付に対応
-- 対応モデルでは画像添付に対応
-- 応答をストリーミング表示し、長文は複数メッセージへ分割
-- `config.yaml` をモデル選択時やメッセージ処理時に再読込
-- ユーザー、ロール、チャンネル単位のアクセス制御
-- `asyncio` と非同期 HTTP クライアントを使用
-
-## 構成
+## 現在の構成
 
 ```text
 Discord
-  |
-  v
+  ↓
 llmcord.py
-  |
-  | OpenAI /v1/chat/completions
-  v
+  ↓ OpenAI /v1/chat/completions
 LLM API
-  |- Ollama
-  |- LM Studio
-  |- vLLM
-  |- その他の OpenAI 互換 API
-  `- リモート LLM API
+  ├─ llama.cpp / llama-server
+  ├─ Ollama
+  ├─ LM Studio
+  ├─ vLLM
+  └─ その他の OpenAI 互換 API
 ```
 
-会話履歴は Discord の返信関係から再構築します。Bot 側に会話データベースはありません。
+会話履歴の正本は Discord の返信チェーンです。通常の会話用データベースは持ちません。
 
-## 必要なもの
+## 主な機能
 
-- [uv](https://docs.astral.sh/uv/)
+- Discord のメンション、返信、DM、スレッドから会話
+- 返信チェーンから会話履歴を再構築
+- `/model` による管理者のモデル切り替え
+- OpenAI `/v1/chat/completions` 互換 API
+- ストリーミング応答と Discord の長文分割
+- テキスト・画像添付
+- user / role / channel 単位のアクセス制御
+- token-aware automatic context compaction
+- `uv` による Python・依存関係管理
+
+## セットアップ
+
+必要なもの:
+
+- uv
 - Discord Bot Token
 - Discord Developer Portal で有効化した `MESSAGE CONTENT INTENT`
 - 使用する LLM の OpenAI 互換 API endpoint
 
-Python は `.python-version` と `pyproject.toml` に従って uv が管理します。現行の対象は Python 3.13 です。
-
-Discord Application の Client ID は、起動時に Bot 招待 URL をログへ表示したい場合に設定します。
-
-## セットアップ
-
-### 1. Clone
-
 ```bash
 git clone https://github.com/KAFKA2306/llmcord.git
 cd llmcord
-```
-
-### 2. 依存関係を同期
-
-```bash
 uv sync --locked
-```
-
-依存関係の正本は `pyproject.toml`、固定解は `uv.lock` です。`pip install` や `requirements.txt` は使用しません。
-
-依存関係を変更する場合は uv 経由で更新します。
-
-```bash
-uv add <package>
-uv remove <package>
-```
-
-`pyproject.toml` と `uv.lock` を同じ変更としてコミットしてください。
-
-### 3. Discord Bot を設定
-
-[Discord Developer Portal](https://discord.com/developers/applications) で Application と Bot を作成します。
-
-Bot の設定で `MESSAGE CONTENT INTENT` を有効にし、Token を環境変数へ設定します。Client ID も使う場合は同様に設定します。
-
-```bash
 export DISCORD_BOT_TOKEN='...'
-export DISCORD_CLIENT_ID='...'
-```
-
-`.env` を使う場合も同じ変数名を使用できます。
-
-```dotenv
-DISCORD_BOT_TOKEN=...
-DISCORD_CLIENT_ID=...
-```
-
-Token を `config.yaml` や Git 管理対象ファイルへ直接書かないでください。
-
-### 4. LLM を設定
-
-`config.yaml` の `providers` と `models` を使用します。
-
-設定名の末尾を `_env` にすると、その値を名前とする環境変数から読み込みます。
-
-```yaml
-bot_token_env: DISCORD_BOT_TOKEN
-client_id_env: DISCORD_CLIENT_ID
-```
-
-ローカル LLM の既定設定例は次のとおりです。
-
-```yaml
-providers:
-  lmstudio:
-    base_url: http://localhost:1234/v1
-
-  ollama:
-    base_url: http://localhost:11434/v1
-
-  vllm:
-    base_url: http://localhost:8000/v1
-```
-
-モデルは `<provider>/<model>` 形式で登録します。
-
-```yaml
-models:
-  ollama/llama4:
-```
-
-`providers` に任意の OpenAI `/v1/chat/completions` 互換 API を追加することもできます。
-
-```yaml
-providers:
-  local:
-    base_url: http://127.0.0.1:8080/v1
-
-models:
-  local/<APIが受け付けるモデル名>:
-```
-
-`models` の先頭が起動時の既定モデルです。
-
-### 5. 起動
-
-```bash
 uv run python llmcord.py
 ```
 
-Docker Compose を使う場合:
+Client ID も使う場合:
+
+```bash
+export DISCORD_CLIENT_ID='...'
+```
+
+Docker Compose:
 
 ```bash
 docker compose up --build
 ```
 
-Docker image 内でも uv を使用します。現行 `docker-compose.yaml` は `network_mode: host` と `restart: unless-stopped` を使用します。ローカル LLM へ接続できない場合は、llmcord を実行している環境から `base_url` へ実際に到達できるか確認してください。
+依存関係の正本は `pyproject.toml`、固定解は `uv.lock` です。`pip install` や `requirements.txt` は使用しません。
 
-## Discord 側の使い方
+## LLM 設定
 
-### サーバー
+`config.yaml` の `providers` と `models` を使います。
 
-Bot をメンションすると新しい会話を開始します。
+```yaml
+providers:
+  llamacpp:
+    base_url: http://localhost:8080/v1
 
-```text
-@bot 質問
+models:
+  llamacpp/my-model:
 ```
 
-Bot の返答へ返信すると、その返信チェーンを会話履歴として続行します。任意のメッセージへ返信しながら Bot をメンションすると、そのメッセージから会話を開始できます。
+モデル名は `<provider>/<backend が受け付ける model name>` です。
 
-### DM
+## 自動コンパクション
 
-`allow_dms: true` の場合、DM では毎回メンションしなくても会話が継続します。新しい会話を開始したい場合は Bot をメンションします。
+長い会話を利用者に管理させません。対応する Local LLM profile では、毎回 backend と同じ token counting path で入力 token 数を測り、hard limit に到達する前に古い履歴を自動圧縮します。
 
-### スレッド
-
-既存メッセージから Discord スレッドを作成し、スレッド内で Bot をメンションすると会話を続けられます。
-
-### モデル切り替え
+active context は次で構成します。
 
 ```text
-/model
+system/developer authority
++ compacted older state
++ recent verbatim messages
++ current user input
++ reserved output budget
 ```
 
-`permissions.users.admin_ids` に登録したユーザーだけがモデルを変更できます。
+system/developer message は圧縮しません。Discord の raw reply-chain history も破壊しません。compaction summary は active context 用の派生データです。
 
-## 設定
+通常の context 超過で「会話を短くしてください」「新しいスレッドを作ってください」と利用者へ要求しません。現在入力自体が大きい場合も、テキストであれば chunk → compact を自動実行します。安全に圧縮できない非テキスト入力は黙って削除せず明示的に失敗します。
 
-### Discord
+### llama-server profile
 
-| 設定 | 内容 | 既定値 |
-| --- | --- | --- |
-| `bot_token` | Discord Bot Token | 必須 |
-| `client_id` | Discord Application Client ID。招待 URL のログ表示に使用 | 未設定 |
-| `status_message` | Bot のステータスメッセージ。最大128文字 | 空欄 |
-| `max_text` | 1メッセージから LLM へ渡す最大文字数。テキスト添付を含む | `100000` |
-| `max_images` | 1メッセージから渡す最大画像数 | `5` |
-| `max_messages` | 返信チェーンから使用する最大メッセージ数 | `25` |
-| `use_plain_responses` | Embed ではなく plaintext component を使う | `false` |
-| `allow_dms` | DM を許可する | `true` |
-| `permissions` | user / role / channel ごとの許可・拒否 | 全許可相当 |
+llama-server では以下を使います。
 
-`status_message` が空の場合、現行コードは upstream の GitHub URL をステータスへ表示します。
+- runtime context window: `GET /props` → `default_generation_settings.n_ctx`
+- exact input token count: `POST /v1/chat/completions/input_tokens`
+- compaction: 同じ production model の `/v1/chat/completions`
 
-`allowed_ids` が空の場合、その分類では allowlist 制限を行いません。`blocked_ids` は拒否対象です。`admin_ids` のユーザーは `/model` を使用できます。
+例:
 
-### LLM
+```yaml
+providers:
+  llamacpp:
+    base_url: http://localhost:8080/v1
+
+models:
+  llamacpp/my-model:
+    context_management:
+      context_window_tokens: auto
+      max_output_tokens: 2048
+      safety_margin_tokens: 512
+      compaction_trigger_tokens: 12000
+      compaction_target_tokens: 8000
+      recent_messages: 3
+      compaction_max_output_tokens: 1024
+```
+
+上の数値は設定形式の例です。production では実際に起動した model / runtime の context contract に合わせます。`context_window_tokens: auto` は llama-server の実 `n_ctx` を読みます。
+
+`compaction_trigger_tokens` は hard limit より小さく、`compaction_target_tokens` は trigger より小さくする必要があります。hard input limit は次です。
+
+```text
+context_window_tokens - max_output_tokens - safety_margin_tokens
+```
+
+context management を有効にした場合、`max_text` / `max_messages` は context-window authority ではありません。返信チェーンを token-aware に処理します。古い実装との互換用 guardrail として設定自体は残しています。
+
+`max_tokens` / `max_completion_tokens` を provider/model の別設定へ重複して書くことは禁止しています。出力 token 予算の正本は `context_management.max_output_tokens` です。
+
+backend が `/props` や llama-server の token count endpoint と異なる場合は `props_url` / `token_count_url` を明示できます。取得・計測に失敗した場合は推測値へ silent fallback せず、その request を失敗させます。
+
+コンパクションが発生した場合は Discord 応答へ次を表示します。
+
+```text
+ℹ️ Long conversation history was automatically compacted
+```
+
+## Discord 入力 guardrail
+
+`config.yaml` の既存設定:
 
 | 設定 | 内容 |
 | --- | --- |
-| `providers` | provider 名ごとの `base_url`、`api_key`、追加 HTTP 設定 |
-| `models` | `<provider>/<model>` ごとのモデル設定 |
-| `system_prompt` | 全会話へ追加する system prompt |
+| `max_text` | context management 無効時の1メッセージ文字数上限 |
+| `max_messages` | context management 無効時の返信チェーン件数上限 |
+| `max_images` | 1メッセージから渡す画像数上限 |
+| `allow_dms` | DM の許可 |
+| `permissions` | user / role / channel の allow / block |
 
-provider では必要に応じて次の項目を使用できます。
+画像数超過や未対応添付は既存 warning で利用者へ明示します。
 
-- `api_key` / `api_key_env`
-- `extra_headers`
-- `extra_query`
-- `extra_body`
+## 現在まだ Issue #1 に残るもの
 
-モデル側へ設定した値は request の追加 body として送られます。
+自動コンパクション以外の無人運用機能は引き続き Issue #1 の対象です。
 
-`system_prompt` では `{date}` と `{time}` を使用でき、ホストのローカル時刻で置換されます。
+- finite request timeout
+- bounded inference queue / concurrency limit
+- retry authority の一元化
+- synthetic generation probe
+- deterministic watchdog / restart storm protection
+- GPU unavailable / CPU fallback detection
+- end-to-end request ID / observability
+- 実 Local LLM を使った障害注入・soak test
 
-## 画像と添付ファイル
+CI や process health だけを production 成功とは扱いません。
 
-テキストまたは画像として認識された添付ファイルだけを処理します。
+## 検証
 
-画像入力はモデル名から vision 対応を推定します。必要な場合はモデル名の末尾へ `:vision` を付けることで画像入力を有効にできます。
-
-上限を超えた入力や未対応添付がある場合は、通常の Embed 応答では警告を表示します。
-
-## 現行実装の運用上の注意
-
-現時点のコードは通常の対話用途を中心とした構成です。Local LLM を長期間無人運用する場合、次の機能はまだ production contract として確立されていません。
-
-- LLM request の明示的な有限 timeout
-- GPU inference の bounded queue
-- 同時生成数の強制上限
-- generation path を通す synthetic health probe
-- backend freeze 時の deterministic watchdog
-- restart storm 防止
-- GPU 消失や CPU fallback の異常判定
-- request_id を使った end-to-end の追跡
-
-これらは [Issue #1](https://github.com/KAFKA2306/llmcord/issues/1) で実装・検証します。
-
-また、既定の `max_text: 100000` と `max_messages: 25` はすべての Local LLM に安全な値ではありません。実際の context length と VRAM に合わせて制限してください。
-
-## トラブルシュート
-
-Bot がメッセージを読まない場合:
-
-1. Discord Developer Portal で `MESSAGE CONTENT INTENT` が有効か確認する
-2. サーバーでは Bot をメンションしているか確認する
-3. `permissions` の allowlist / blocklist を確認する
-
-LLM に接続できない場合:
-
-1. `providers.<name>.base_url` を確認する
-2. llmcord の実行環境から endpoint へ到達できるか確認する
-3. `<provider>/<model>` の provider 名が `providers` に存在するか確認する
-4. API key が必要な provider では環境変数が設定されているか確認する
-
-生成中の例外は現在ログへ記録されます。無人運用での自動復旧は Issue #1 の対象です。
+```bash
+uv lock --check
+uv sync --locked
+uv run --locked --no-sync python -m py_compile llmcord.py context_management.py
+uv run --locked --no-sync python -m unittest discover -s tests -v
+docker build -t llmcord:test .
+```
 
 ## ファイル
 
 ```text
-llmcord.py           Discord Bot 本体
-config.yaml          実行設定と provider / model 定義
-pyproject.toml        Python / uv / 直接依存の正本
-uv.lock               解決済み依存バージョン
-.python-version       uv が使用する Python 系列
-Dockerfile            uv ベースのコンテナイメージ
-docker-compose.yaml   Compose 実行設定
-.github/workflows/     CI
-LICENSE.md             MIT License
-README.md              この文書
+llmcord.py                     Discord Bot 本体
+context_management.py          token-aware automatic compaction
+config.yaml                    実行設定 / provider / model 定義
+pyproject.toml                 Python / 直接依存の正本
+uv.lock                        固定済み依存関係
+.python-version                Python 系列
+Dockerfile                     uv ベースのコンテナ
+Docker-compose.yaml            Compose 実行設定
+.github/workflows/ci.yml       CI
+tests/test_context_management.py  context management tests
+LICENSE.md                     MIT License
 ```
 
-## Upstream / License
+## License
 
-元のプロジェクト:
-
-https://github.com/jakobdylanc/llmcord
-
-MIT License。著作権表示とライセンス本文は `LICENSE.md` を参照してください。
+MIT License。`LICENSE.md` を参照してください。

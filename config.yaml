@@ -58,6 +58,9 @@ providers:
   vllm:
     base_url: http://localhost:8000/v1
 
+  llamacpp:
+    base_url: http://localhost:8080/v1
+
 models:
   openai/gpt-5.5:
     reasoning_effort: high
@@ -69,6 +72,20 @@ models:
       - type: openrouter:web_fetch
 
   ollama/llama4:
+
+  # llama-server production example. Context-management values are deliberately
+  # required instead of silently defaulted: derive them from the actual runtime/model contract.
+  # llamacpp/<model-alias>:
+  #   context_management:
+  #     context_window_tokens: auto  # reads /props -> default_generation_settings.n_ctx
+  #     max_output_tokens: <required>
+  #     safety_margin_tokens: <required>
+  #     compaction_trigger_tokens: <required>  # start compaction before the hard limit
+  #     compaction_target_tokens: <required>   # target size after compaction; must be below trigger
+  #     recent_messages: <required>
+  #     compaction_max_output_tokens: <required>
+  #     # token_count_url: http://localhost:8080/v1/chat/completions/input_tokens
+  #     # props_url: http://localhost:8080/props
 
 system_prompt: |
   You are a snarky Discord chatbot. Be informative but harsh.
