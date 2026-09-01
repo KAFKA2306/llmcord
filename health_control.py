@@ -94,14 +94,16 @@ async def check_nvidia_gpu(
 ) -> None:
     """Require a visible NVIDIA GPU and an expected minimum resident VRAM footprint.
 
-    For a fixed llama-server deployment, calibrating min_vram_used_mib above the CPU-only
-    baseline makes a gross CPU fallback fail closed instead of being treated as healthy.
+    This is a coarse fail-closed check. Exact backend-process/GPU attribution remains a
+    separate production acceptance requirement because unrelated GPU allocations can exist.
     """
 
     if not isinstance(device_index, int) or isinstance(device_index, bool) or device_index < 0:
         raise HealthControlError("GPU device_index must be a non-negative integer")
     if not isinstance(min_vram_used_mib, int) or isinstance(min_vram_used_mib, bool) or min_vram_used_mib < 0:
         raise HealthControlError("min_vram_used_mib must be a non-negative integer")
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        raise HealthControlError("GPU check timeout must be a positive number")
 
     process = await asyncio.create_subprocess_exec(
         executable,
@@ -144,8 +146,9 @@ async def check_nvidia_gpu(
 class BackendWatchdog:
     """Deterministic health state machine for one production inference backend.
 
-    Health is established by a real generation probe plus the optional GPU check.
-    A shallow HTTP health endpoint is intentionally not authoritative.
+    Startup and recovery require a real generation probe plus the optional GPU check.
+    Healthy-state user requests provide the normal health signal; no competing background
+    generation is injected while the backend is accepting user inference.
     """
 
     def __init__(
@@ -197,16 +200,22 @@ class BackendWatchdog:
     async def report_failure(self, error: BaseException | str) -> None:
         message = str(error)
         async with self._state_lock:
+            previous_state = self._state
             self._consecutive_failures += 1
             self._last_error = message
             if self._consecutive_failures >= self.policy.failure_threshold:
                 self._state = BackendState.DEGRADED
                 self._wake.set()
-            elif self._state != BackendState.RECOVERING:
+            elif previous_state == BackendState.STARTING:
+                # Never admit user work before at least one real generation probe has succeeded.
+                self._state = BackendState.STARTING
+            elif previous_state != BackendState.RECOVERING:
                 self._state = BackendState.SUSPECT
             failures = self._consecutive_failures
+            state = self._state
         self._logger.warning(
-            "backend health failure count=%s threshold=%s error=%s",
+            "backend health failure state=%s count=%s threshold=%s error=%s",
+            state,
             failures,
             self.policy.failure_threshold,
             message,
@@ -250,26 +259,42 @@ class BackendWatchdog:
         self._logger.info("backend recovery succeeded attempt=%s", attempt)
         await self.report_success()
 
+    async def _wait(self, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=seconds)
+        except TimeoutError:
+            pass
+        self._wake.clear()
+
     async def run(self) -> None:
         """Run until stop() is called.
 
-        Synthetic probes run only while normal user inference is idle. Request-path failures
-        feed the same state machine, so the watchdog does not add competing GPU work during
-        healthy active inference.
+        Synthetic generation is used at startup and during degraded/recovery only. While
+        HEALTHY or SUSPECT, the watchdog does not issue background generation, which keeps
+        the production concurrency authority in the normal inference gate. Real user-request
+        success/failure drives the healthy/suspect/degraded transitions during normal use.
         """
 
         try:
             while not self._stop.is_set():
                 snapshot = await self.snapshot()
+
+                if snapshot.state == BackendState.STARTING:
+                    if await self._idle():
+                        try:
+                            await self._verify()
+                        except Exception as exc:
+                            await self.report_failure(exc)
+                        else:
+                            await self.report_success()
+                    await self._wait(self.policy.probe_interval_seconds)
+                    continue
+
                 if snapshot.state == BackendState.DEGRADED:
                     await self._attempt_recovery()
                     snapshot = await self.snapshot()
                     if snapshot.state == BackendState.DEGRADED:
-                        try:
-                            await asyncio.wait_for(self._wake.wait(), timeout=self.policy.restart_cooldown_seconds)
-                        except TimeoutError:
-                            pass
-                        self._wake.clear()
+                        await self._wait(self.policy.restart_cooldown_seconds)
                         if await self._idle():
                             try:
                                 await self._verify()
@@ -277,21 +302,11 @@ class BackendWatchdog:
                                 await self.report_failure(exc)
                             else:
                                 await self.report_success()
-                        continue
+                    continue
 
-                if await self._idle():
-                    try:
-                        await self._verify()
-                    except Exception as exc:
-                        await self.report_failure(exc)
-                    else:
-                        await self.report_success()
-
-                try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=self.policy.probe_interval_seconds)
-                except TimeoutError:
-                    pass
-                self._wake.clear()
+                # HEALTHY/SUSPECT: user-generation outcomes are the health signal. Do not
+                # race a background synthetic request against the max_concurrency=1 path.
+                await self._wait(self.policy.probe_interval_seconds)
         finally:
             async with self._state_lock:
                 self._state = BackendState.STOPPED
