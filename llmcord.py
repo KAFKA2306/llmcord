@@ -24,6 +24,7 @@ from runtime_control import (
     InferenceGate,
     InferenceQueueFull,
     InferenceQueueTimeout,
+    InferenceUnavailable,
     RuntimePolicy,
     stream_with_timeouts,
 )
@@ -381,15 +382,6 @@ async def on_message(new_msg: discord.Message) -> None:
     provider_slash_model = curr_model
     provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
 
-    if backend_watchdog is not None and provider_slash_model == health_target_model and not await backend_watchdog.is_accepting():
-        snapshot = await backend_watchdog.snapshot()
-        logging.warning("backend unavailable state=%s failures=%s", snapshot.state, snapshot.consecutive_failures)
-        await new_msg.reply(
-            f"⚠️ Local LLM backend is {snapshot.state}. New requests are paused until a real generation probe succeeds.",
-            silent=True,
-        )
-        return
-
     request_id = str(new_msg.id)
     provider_config = config["providers"][provider]
 
@@ -428,8 +420,22 @@ async def on_message(new_msg: discord.Message) -> None:
         return
     extra_body = provider_extra_body | model_parameters or None
 
+    admission_check = None
+    if backend_watchdog is not None and provider_slash_model == health_target_model:
+        admission_check = backend_watchdog.is_accepting
+
     try:
-        lease = await inference_gate.acquire()
+        lease = await inference_gate.acquire(admission_check=admission_check)
+    except InferenceUnavailable:
+        snapshot = await backend_watchdog.snapshot() if backend_watchdog is not None else None
+        state = snapshot.state if snapshot is not None else "unavailable"
+        failures = snapshot.consecutive_failures if snapshot is not None else "unknown"
+        logging.warning("request_id=%s backend unavailable state=%s failures=%s", request_id, state, failures)
+        await new_msg.reply(
+            f"⚠️ Local LLM backend is {state}. New requests are paused until a real generation probe succeeds.",
+            silent=True,
+        )
+        return
     except InferenceQueueFull:
         logging.warning("request_id=%s inference queue full", request_id)
         await new_msg.reply("⚠️ Local LLM is busy and the bounded queue is full. This request was not accepted.", silent=True)
