@@ -20,13 +20,16 @@ runtime_control:
 production:
   enabled: true
   backend: llamacpp
+  backend_release: v0.3.0
   backend_version_or_commit: c1d0e7a004015f23bc0233470b747b596f29b264
   backend_executable: ~/.local/opt/llama.cpp-v0.3.0/bin/llama-server
   model: llamacpp/ornith-1.5-9b-q6_k
   model_artifact:
     upstream: ornith-ai/Ornith-1.5-9B
+    artifact_repo: ornith-ai/Ornith-1.5-9B-GGUF
     artifact: Ornith-1.5-9B-Q6_K.gguf
     revision: 2b651f3
+    artifact_url: https://huggingface.co/ornith-ai/Ornith-1.5-9B-GGUF/resolve/2b651f3/Ornith-1.5-9B-Q6_K.gguf
     sha256: b6f76e74f86245b3caee014b797c10dca931c4dfdaabfb134eab655f81e4154a
     quantization_or_dtype: Q6_K
     context_window_tokens: 32768
