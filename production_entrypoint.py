@@ -19,15 +19,18 @@ def configure_runtime_environment(contract: ProductionContract | None) -> None:
 def main() -> None:
     config_path = Path("config.yaml")
     config = load_resolved_config(str(config_path))
-    contract = validate_production_contract(config)
+    # Backend startup owns expensive binary/model artifact verification. The bot verifies
+    # the canonical manifest and execution projections without hashing the GGUF again.
+    contract = validate_production_contract(config, verify_artifact=False)
     configure_runtime_environment(contract)
 
     if contract is None:
         logging.info("production contract disabled; starting llmcord without production validation")
     else:
         logging.info(
-            "production contract validated backend=%s model=%s network_mode=%s supervisor=%s gpu_required=%s",
+            "production contract validated backend=%s release=%s model=%s network_mode=%s supervisor=%s gpu_required=%s",
             contract.backend,
+            contract.backend_release,
             contract.model,
             contract.network_mode,
             contract.supervisor_kind,
