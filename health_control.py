@@ -268,8 +268,9 @@ class BackendWatchdog:
     """Deterministic health state machine for one production inference backend.
 
     Startup and recovery require a real generation probe plus the optional GPU check.
-    Healthy-state user requests provide the normal health signal; no competing background
-    generation is injected while the backend is accepting user inference.
+    User-generation success is accepted as healthy only when the optional GPU check also
+    succeeds. HEALTHY/SUSPECT states perform a lightweight periodic GPU/process check but do
+    not inject background model generation, preserving inference concurrency=1.
     """
 
     def __init__(
@@ -311,20 +312,33 @@ class BackendWatchdog:
     async def is_accepting(self) -> bool:
         return (await self.snapshot()).accepting
 
-    async def report_success(self) -> None:
+    async def _mark_healthy(self) -> None:
         async with self._state_lock:
             self._state = BackendState.HEALTHY
             self._consecutive_failures = 0
             self._restart_attempts = 0
             self._last_error = None
 
-    async def report_failure(self, error: BaseException | str) -> None:
+    async def report_success(self) -> None:
+        """Report successful user generation, retaining GPU/process health as authority."""
+        if self._gpu_check is not None:
+            try:
+                await self._gpu_check()
+            except Exception as exc:
+                await self.report_failure(exc, immediate=True)
+                return
+        await self._mark_healthy()
+
+    async def report_failure(self, error: BaseException | str, *, immediate: bool = False) -> None:
         message = str(error)
         async with self._state_lock:
             previous_state = self._state
-            self._consecutive_failures += 1
+            next_failures = self._consecutive_failures + 1
+            if immediate:
+                next_failures = max(next_failures, self.policy.failure_threshold)
+            self._consecutive_failures = next_failures
             self._last_error = message
-            if self._consecutive_failures >= self.policy.failure_threshold:
+            if immediate or self._consecutive_failures >= self.policy.failure_threshold:
                 self._state = BackendState.DEGRADED
                 self._wake.set()
             elif previous_state == BackendState.STARTING:
@@ -352,6 +366,16 @@ class BackendWatchdog:
             await self._gpu_check()
         await self._probe()
 
+    async def _check_runtime_gpu(self) -> None:
+        if self._gpu_check is None:
+            return
+        try:
+            await self._gpu_check()
+        except Exception as exc:
+            # GPU/process disappearance or CPU fallback is a hard production-health failure,
+            # not a transient generation failure that should remain accepting until threshold.
+            await self.report_failure(exc, immediate=True)
+
     async def _attempt_recovery(self) -> None:
         async with self._state_lock:
             if self._state != BackendState.DEGRADED:
@@ -377,7 +401,7 @@ class BackendWatchdog:
             return
 
         self._logger.info("backend recovery succeeded attempt=%s", attempt)
-        await self.report_success()
+        await self._mark_healthy()
 
     async def _wait(self, seconds: float) -> None:
         try:
@@ -390,9 +414,9 @@ class BackendWatchdog:
         """Run until stop() is called.
 
         Synthetic generation is used at startup and during degraded/recovery only. While
-        HEALTHY or SUSPECT, the watchdog does not issue background generation, which keeps
-        the production concurrency authority in the normal inference gate. Real user-request
-        success/failure drives the healthy/suspect/degraded transitions during normal use.
+        HEALTHY or SUSPECT, no background generation is injected. The watchdog still checks
+        GPU/process presence periodically when inference is idle, and every successful user
+        generation is followed by the same GPU/process check before health is reset to HEALTHY.
         """
 
         try:
@@ -406,7 +430,7 @@ class BackendWatchdog:
                         except Exception as exc:
                             await self.report_failure(exc)
                         else:
-                            await self.report_success()
+                            await self._mark_healthy()
                     await self._wait(self.policy.probe_interval_seconds)
                     continue
 
@@ -421,10 +445,14 @@ class BackendWatchdog:
                             except Exception as exc:
                                 await self.report_failure(exc)
                             else:
-                                await self.report_success()
+                                await self._mark_healthy()
                     continue
 
                 await self._wait(self.policy.probe_interval_seconds)
+                if self._stop.is_set():
+                    continue
+                if self._gpu_check is not None and await self._idle():
+                    await self._check_runtime_gpu()
         finally:
             async with self._state_lock:
                 self._state = BackendState.STOPPED
