@@ -12,7 +12,7 @@ Discord を OpenAI `/v1/chat/completions` 互換 LLM のフロントエンドと
 Discord
   ↓
 llmcord.py
-  ↓ bounded admission / finite deadlines
+  ↓ bounded admission / finite deadlines / optional health gate
 OpenAI /v1/chat/completions
   ↓
 LLM API
@@ -37,6 +37,8 @@ LLM API
 - token-aware automatic context compaction
 - bounded inference admission / queue
 - connect / first-token / total-generation deadline
+- real-generation synthetic health probe
+- optional deterministic backend watchdog / bounded restart
 - OpenAI SDK automatic retry disabled (`max_retries=0`)
 - Discord message ID を request ID として backend header / log へ伝播
 - `uv` による Python・依存関係管理
@@ -98,6 +100,45 @@ runtime_control:
 OpenAI Python SDK の automatic retry は `max_retries=0` とし、Discord handler / SDK / watchdog が独立に再試行する retry storm を作りません。現時点の production policy は自動再試行なしです。
 
 `runtime_control` は context window の推測値ではなく運用上の admission / deadline policy です。値を変更する場合はプロセスを再起動します。
+
+## Backend health / watchdog
+
+`backend_probe.py` は process/TCP/`/health`/`/v1/models` ではなく、OpenAI-compatible `/v1/chat/completions` に短い実生成を送り `PONG` を受け取れることを health authority とします。provider の `base_url` が `.../v1` で終わる場合も `/v1` を二重付与しません。
+
+watchdog はデフォルト無効です。production で1つの Local LLM backend/model と supervisor authority を決めた場合だけ `backend_watchdog.enabled: true` にします。
+
+```yaml
+backend_watchdog:
+  enabled: true
+  model: llamacpp/my-model
+  probe_interval_seconds: 30
+  probe_timeout_seconds: 15
+  failure_threshold: 2
+  restart_cooldown_seconds: 10
+  restart_settle_seconds: 5
+  max_restart_attempts: 3
+  restart_timeout_seconds: 30
+  restart_command:
+    - systemctl
+    - restart
+    - llama-server.service
+```
+
+有効時の状態遷移は次です。
+
+```text
+starting (admission closed)
+  -> generation probe success -> healthy (admission open)
+  -> probe failure -> suspect
+  -> consecutive failure threshold -> unavailable (admission closed)
+  -> configured supervisor restart -> restarting
+  -> post-restart generation probe success -> healthy
+  -> bounded restart attempts exhausted -> degraded (admission closed)
+```
+
+watchdog 有効時は `backend_watchdog.model` を process-wide production model として固定し、`/model` から別modelへ切り替えません。既にqueueで待っている request も、health gate が閉じた後に inference slot を取得した場合は backend へ送らず失敗させます。
+
+`restart_command` は shell string ではなく argv list として `create_subprocess_exec` で実行します。shell interpolation は使いません。restart authority はこの command 1箇所に限定し、同じ backend を別の watchdog から重複restartしないでください。systemd / Docker 等の最終 production supervisor と network authority は Issue #13 で固定します。
 
 ## LLM 設定
 
@@ -195,21 +236,20 @@ backend が `/props` や llama-server の token count endpoint と異なる場�
 
 ## 現在まだ Issue #1 に残るもの
 
-- synthetic generation probe
-- deterministic watchdog / backend restart
-- restart storm protection
 - GPU unavailable / CPU fallback detection
-- machine-readable metrics
+- auto compaction の実 tokenizer・長期会話・attachment hardening
+- machine-readable observability
+- production backend / model / network / supervisor の固定
 - 実 Local LLM を使った障害注入・soak test
 
-CI や process health だけを production 成功とは扱いません。
+CI や process health だけを production 成功とは扱いません。watchdog の実GPU/Local LLM障害注入は Issue #14 の production acceptance で確認します。
 
 ## 検証
 
 ```bash
 uv lock --check
 uv sync --locked
-uv run --locked --no-sync python -m py_compile llmcord.py context_management.py runtime_control.py
+uv run --locked --no-sync python -m py_compile llmcord.py backend_probe.py backend_watchdog.py context_management.py runtime_control.py
 uv run --locked --no-sync python -m unittest discover -s tests -v
 docker build -t llmcord:test .
 ```
@@ -218,6 +258,8 @@ docker build -t llmcord:test .
 
 ```text
 llmcord.py                        Discord Bot 本体
+backend_probe.py                  real-generation backend health probe
+backend_watchdog.py               deterministic health/restart state machine
 context_management.py             token-aware automatic compaction
 runtime_control.py                 bounded admission / finite stream deadlines
 config.yaml                        実行設定 / provider / model 定義
@@ -227,6 +269,8 @@ uv.lock                            固定済み依存関係
 Dockerfile                         uv ベースのコンテナ
 docker-compose.yaml                Compose 実行設定
 .github/workflows/ci.yml           CI
+tests/test_backend_probe.py        backend probe tests
+tests/test_backend_watchdog.py     watchdog state-machine tests
 tests/test_context_management.py   context management tests
 tests/test_runtime_control.py       runtime control tests
 LICENSE.md                         MIT License
