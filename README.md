@@ -49,12 +49,15 @@ FreeToken は #7 の実機比較・24h soak・無人復旧条件を満たすま�
 | SHA256 | `b6f76e74f86245b3caee014b797c10dca931c4dfdaabfb134eab655f81e4154a` |
 | quantization | `Q6_K` |
 | context | `32768` tokens |
+| input | text only (`max_images: 0`) |
 | API | `http://127.0.0.1:8080/v1` |
 | supervisor | `systemd --user` |
 | backend unit | `llmcord-llama-server.service` |
 | bot unit | `llmcord.service` |
 
 モデル本来の最大 context と production context は別物です。production は VRAM と無人運用の上限を明示するため `32768` に固定します。通常の長い会話は利用者に整理させず、llmcord が token-aware auto compaction します。
+
+現在は `mmproj` artifact を production contract に含めていないため画像入力を無効化します。画像を production 対応にする場合は、`mmproj` の revision / SHA256 / VRAM 条件を同じ authority に追加してから有効化します。
 
 ## セットアップ
 
@@ -79,7 +82,6 @@ git checkout c1d0e7a004015f23bc0233470b747b596f29b264
 cmake -S . -B build \
   -DGGML_CUDA=ON \
   -DCMAKE_BUILD_TYPE=Release \
-  -DLLAMA_BUILD_IS_DEV=OFF \
   -DCMAKE_INSTALL_PREFIX="$HOME/.local/opt/llama.cpp-v0.3.0"
 cmake --build build -j --target llama-server
 cmake --install build
@@ -95,33 +97,42 @@ curl -fL \
   -o ~/.local/share/llmcord/models/Ornith-1.5-9B-Q6_K.gguf \
   https://huggingface.co/ornith-ai/Ornith-1.5-9B-GGUF/resolve/2b651f3/Ornith-1.5-9B-Q6_K.gguf
 
-echo 'b6f76e74f86245b3caee014b797c10dca931c4dfdaabfb134eab655f81e4154a  /home/'"$USER"'/.local/share/llmcord/models/Ornith-1.5-9B-Q6_K.gguf' | sha256sum -c -
+printf '%s  %s\n' \
+  'b6f76e74f86245b3caee014b797c10dca931c4dfdaabfb134eab655f81e4154a' \
+  "$HOME/.local/share/llmcord/models/Ornith-1.5-9B-Q6_K.gguf" \
+  | sha256sum -c -
 ```
 
 backend service 起動時にも `production_runtime.py` が同じ SHA256 を計算し、不一致なら `llama-server` を起動しません。
 
-### 4. Discord secrets
+### 4. Discord secret
 
 ```bash
 mkdir -p ~/.config/llmcord
 cat > ~/.config/llmcord/llmcord.env <<'EOF'
 DISCORD_BOT_TOKEN=replace-me
-DISCORD_CLIENT_ID=replace-me
 EOF
 chmod 600 ~/.config/llmcord/llmcord.env
 ```
 
-Token は repository、image、service unit に埋め込みません。
+`DISCORD_CLIENT_ID` が必要な場合だけ同じファイルへ追加します。Token は repository、image、service unit に埋め込みません。
 
 ### 5. systemd user services
 
+production は user manager が login session の外でも生存することを前提にします。
+
 ```bash
+systemctl --user is-system-running
+sudo loginctl enable-linger "$USER"
+
 mkdir -p ~/.config/systemd/user
 ln -sfn ~/llmcord/ops/systemd/llmcord-llama-server.service ~/.config/systemd/user/llmcord-llama-server.service
 ln -sfn ~/llmcord/ops/systemd/llmcord.service ~/.config/systemd/user/llmcord.service
 systemctl --user daemon-reload
 systemctl --user enable --now llmcord-llama-server.service llmcord.service
 ```
+
+`systemctl --user` が利用できない環境はこの production contract と一致しません。別 supervisor へ silent fallback しません。
 
 `llmcord-llama-server.service` が backend process の supervisor authority です。bot の watchdog は backend process を直接 kill / spawn せず、次だけを呼びます。
 
@@ -151,11 +162,13 @@ uv run --locked --no-sync python production_runtime.py check --config config.yam
 - backend version / commit 不一致
 - model artifact 不在
 - model SHA256 不一致
+- artifact repo / revision / filename / local path の不一致
 - `0.0.0.0` など loopback 以外の bind
 - `latest` / `main` など未固定 revision
 - production 以外の provider / model 混在
-- context window の二重 authority
-- watchdog model / systemd restart interface の不一致
+- context window / concurrency の二重 authority
+- watchdog model / GPU contract / systemd restart interface の不一致
+- `mmproj` 未固定状態での画像入力有効化
 
 ## Runtime control
 
@@ -201,16 +214,18 @@ Reply exactly: PONG
 
 ## Rollback
 
-llmcord は戻したい main commit を checkout し、unit を reload / restart します。
+llmcord は戻したい verified main commit を checkout し、unit を reload / restart します。
 
 ```bash
 cd ~/llmcord
-git checkout <verified-commit>
+git checkout <verified-main-commit>
+uv sync --locked
+uv run --locked --no-sync python production_runtime.py check --config config.yaml
 systemctl --user daemon-reload
 systemctl --user restart llmcord-llama-server.service llmcord.service
 ```
 
-backend/model を変更した release の rollback では、その commit の `config.yaml` に記録された llama.cpp commit と model SHA256 に戻します。`production_runtime.py check` が一致するまで service は production-ready と扱いません。
+backend/model を変更した release の rollback では、その commit の `config.yaml` に記録された llama.cpp commit と model SHA256 に戻します。`production_runtime.py check` が一致するまで production-ready と扱いません。
 
 ## 検証
 
