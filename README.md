@@ -15,7 +15,8 @@ llmcord
   ├─ token-aware auto compaction
   ├─ bounded queue / concurrency
   ├─ finite generation deadlines
-  └─ deterministic watchdog
+  ├─ deterministic watchdog
+  └─ machine-readable production events
          ↓
 OpenAI-compatible Local LLM
          ↓
@@ -41,6 +42,7 @@ NVIDIA GPU
 - restart 後に probe が成功するまで対象 Local LLM の受付を再開しない
 - NVIDIA GPU visibility / VRAM residency / backend compute-process attribution
 - production manifest の fail-closed validation
+- production entrypoint の JSON event logging と本文 fail-closed redaction
 
 ## セットアップ
 
@@ -192,13 +194,51 @@ restart 後は GPU check と synthetic generation probe の両方が成功して
 GPU必須productionでは `nvidia-smi` を2段階で確認します。
 
 1. 選択deviceの `uuid / memory.used / utilization.gpu / temperature.gpu`
-2. `--query-compute-apps` の `gpu_uuid / pid / process_name / used_gpu_memory`
+2. 1で得たGPU UUIDを `--id=<GPU UUID>` に指定し、`--query-compute-apps=pid,process_name,used_gpu_memory` を実行
 
-総VRAMだけでは healthy としません。選択GPU UUIDの compute process 一覧に `production.gpu.process_name_pattern` と一致するbackend processが存在することを要求します。
+総VRAMだけでは healthy としません。選択GPUに限定した compute process 一覧へ `production.gpu.process_name_pattern` と一致するbackend processが存在することを要求します。
 
-したがって、別アプリがGPUを使っていて総VRAMだけ高い一方、Local LLM backendがCPU fallbackしている状態は fail-closed になります。Windows/WDDMではprocess単位 `used_gpu_memory` が `N/A` になる場合があるため、その値自体は必須にせず、GPU UUID・PID・process nameを主な帰属条件にします。
+したがって、別アプリがGPUを使っていて総VRAMだけ高い一方、Local LLM backendがCPU fallbackしている状態は fail-closed になります。Windows/WDDMではprocess単位 `used_gpu_memory` が `N/A` になる場合があるため、その値自体は必須にせず、GPUのUUID filter・PID・process nameを主な帰属条件にします。
 
 実backendを選定したら `process_name_pattern` は広い `python` 等ではなく、そのruntimeをできるだけ一意に識別できるregexへ固定します。backendが汎用Python processしか見せない場合は、#10 の実機検証で追加のPID/supervisor帰属が必要です。
+
+## Production observability
+
+production entrypoint は Bot 本体を起動する前に structured logging を設定し、stdout/stderr の運用ログを1行1JSON objectへ変換します。production backend/modelが確定している場合は各eventへ `provider` / `model` を付加します。
+
+現在分類する主要event:
+
+```text
+production.startup
+request.received
+request.rejected
+queue.admitted
+queue.rejected
+queue.timeout
+context.compacted
+generation.timeout
+generation.failure
+probe.success
+watchdog.failure
+watchdog.restart
+watchdog.recovered
+log
+```
+
+`request_id` を含む既存request eventはDiscord message IDをそのまま引き継ぎます。
+
+観測ログには以下を出しません。
+
+- Discord message本文
+- prompt / system prompt
+- attachment本文
+- response本文
+- API key / Authorization / Discord bot token
+- user ID（`request.received`では件数だけを保持）
+
+既知のruntime logはevent/fieldへ変換します。分類できない新しいlogは安全側に倒し、**元のmessage本文を捨てて** `event=log`, `classified=false`, level/logger/request_idだけを保持します。観測不能より可用性を優先するため、observability変換失敗自体はBot requestを停止させません。
+
+このevent streamは #14 の障害注入・soak evidence の入力にします。現時点では全 #12 指標を実装済みとは扱いません。特に generation success/duration/output tokens、queue depth、GPU数値event、direct `llmcord.py` 開発実行のlegacy loggingは残課題です。
 
 ## 検証
 
@@ -206,7 +246,7 @@ GPU必須productionでは `nvidia-smi` を2段階で確認します。
 uv lock --check
 uv sync --locked
 uv run --locked --no-sync python -m py_compile \
-  llmcord.py backend_probe.py context_management.py runtime_control.py health_control.py \
+  llmcord.py backend_probe.py context_management.py runtime_control.py health_control.py observability.py \
   production_contract.py production_entrypoint.py
 uv run --locked --no-sync python -m unittest discover -s tests -v
 docker build -t llmcord:test .
@@ -222,6 +262,7 @@ context_management.py       token-aware auto compaction
 runtime_control.py           queue / concurrency / generation deadlines
 backend_probe.py             real-generation health probe
 health_control.py            watchdog / restart / GPU process health
+observability.py             production JSON events / privacy filter
 production_contract.py       canonical deployment validation
 production_entrypoint.py     production fail-closed startup path
 config.yaml                  runtime + canonical production manifest
