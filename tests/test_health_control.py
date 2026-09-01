@@ -85,6 +85,23 @@ class HealthControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(snapshot.accepting)
         self.assertEqual(3, snapshot.consecutive_failures)
 
+    async def test_repeated_degraded_failure_does_not_self_wake_cooldown(self):
+        async def probe():
+            return None
+
+        async def idle():
+            return True
+
+        watchdog = BackendWatchdog(self.policy(), probe=probe, idle=idle)
+        await watchdog.report_success()
+        await watchdog.report_failure("GPU disappeared", immediate=True)
+        self.assertTrue(watchdog._wake.is_set())
+        watchdog._wake.clear()
+
+        await watchdog.report_failure("GPU still unavailable")
+        self.assertEqual(BackendState.DEGRADED, (await watchdog.snapshot()).state)
+        self.assertFalse(watchdog._wake.is_set())
+
     async def test_user_generation_success_requires_gpu_health(self):
         gpu_healthy = True
         gpu_checks = 0
