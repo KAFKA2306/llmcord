@@ -1,16 +1,13 @@
-# Any setting can be read from an environment variable by appending "_env" to its name (e.g. bot_token_env: DISCORD_BOT_TOKEN).
-
+# Production authority for KAFKA2306/llmcord. Secrets come from environment variables.
 bot_token_env: DISCORD_BOT_TOKEN
 client_id_env: DISCORD_CLIENT_ID
 
-status_message: 
-
+status_message:
 max_text: 100000
-max_images: 5
+# No mmproj artifact is pinned in production, so image input is explicitly disabled.
+max_images: 0
 max_messages: 25
 
-# Process-level inference admission and deadlines. These values are an explicit
-# operational policy, not model-context guesses. Change them intentionally for the deployment.
 runtime_control:
   max_concurrency: 1
   max_queue_size: 4
@@ -20,47 +17,39 @@ runtime_control:
   stream_idle_timeout_seconds: 120
   total_generation_timeout_seconds: 1800
 
-# Canonical deployment authority. Keep disabled until #7 has selected the actual backend/model.
-# Once enabled, production_entrypoint.py validates this manifest before starting Discord.
-# Existing providers/models/health_control values are execution projections and must match it exactly.
 production:
-  enabled: false
-  backend: <selected-provider>
-  backend_version_or_commit: <pinned-release-or-commit>
-  model: <provider>/<model-alias>
+  enabled: true
+  backend: llamacpp
+  backend_version_or_commit: c1d0e7a004015f23bc0233470b747b596f29b264
+  backend_executable: ~/.local/opt/llama.cpp-v0.3.0/bin/llama-server
+  model: llamacpp/ornith-1.5-9b-q6_k
   model_artifact:
-    upstream: <upstream-model>
-    artifact: <exact-artifact-name>
-    revision: <pinned-revision-or-commit>
-    sha256: <64-character-sha256>
-    quantization_or_dtype: <exact-quantization-or-dtype>
-    context_window_tokens: 1
-    # Optional. If the bot host/container can see the model file, startup verifies SHA-256.
-    # verify_path: /models/model.gguf
+    upstream: ornith-ai/Ornith-1.5-9B
+    artifact: Ornith-1.5-9B-Q6_K.gguf
+    revision: 2b651f3
+    sha256: b6f76e74f86245b3caee014b797c10dca931c4dfdaabfb134eab655f81e4154a
+    quantization_or_dtype: Q6_K
+    context_window_tokens: 32768
+    verify_path: ~/.local/share/llmcord/models/Ornith-1.5-9B-Q6_K.gguf
   network:
-    # native | wsl | docker
-    mode: native
+    mode: wsl
     endpoint: http://127.0.0.1:8080/v1
   supervisor:
-    # systemd | docker-compose | windows-service | external
     kind: systemd
     restart_command:
       - systemctl
+      - --user
       - restart
-      - llama-server.service
+      - llmcord-llama-server.service
   gpu:
     required: true
     device_index: 0
-    min_vram_used_mib: 1
-    # Regex matched against nvidia-smi compute-process names on the selected GPU UUID.
-    process_name_pattern: <backend-process-regex>
+    min_vram_used_mib: 6000
+    process_name_pattern: 'llama-server(?:\.exe)?$'
 
-# Runtime watchdog. In production this must match the production manifest above.
-# STARTING / DEGRADED / RECOVERING states reject new requests for the target model until a real generation probe succeeds.
-# restart_command is argv, never a shell string.
 health_control:
-  enabled: false
-  model: llamacpp/<model-alias>
+  enabled: true
+  model: llamacpp/ornith-1.5-9b-q6_k
   probe_interval_seconds: 60
   probe_timeout_seconds: 30
   probe_prompt: "Reply exactly: PONG"
@@ -68,14 +57,18 @@ health_control:
   probe_max_tokens: 8
   failure_threshold: 2
   restart_cooldown_seconds: 60
-  post_restart_grace_seconds: 10
+  post_restart_grace_seconds: 15
   max_restart_attempts: 3
   restart_command_timeout_seconds: 30
-  restart_command: []
+  restart_command:
+    - systemctl
+    - --user
+    - restart
+    - llmcord-llama-server.service
   nvidia_gpu:
-    enabled: false
+    enabled: true
     device_index: 0
-    min_vram_used_mib: 0
+    min_vram_used_mib: 6000
     timeout_seconds: 5
 
 use_plain_responses: false
@@ -86,75 +79,27 @@ permissions:
     admin_ids: []
     allowed_ids: []
     blocked_ids: []
-
   roles:
     allowed_ids: []
     blocked_ids: []
-
   channels:
     allowed_ids: []
     blocked_ids: []
 
 providers:
-  openrouter:
-    base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
-
-  openai:
-    base_url: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
-
-  x-ai:
-    base_url: https://api.x.ai/v1
-    api_key_env: X_AI_API_KEY
-
-  google:
-    base_url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key_env: GEMINI_API_KEY
-
-  azure-openai:
-    base_url: https://<resource name>.openai.azure.com/openai/deployments/<deployment name>
-    api_key_env: AZURE_OPENAI_API_KEY
-    extra_query:
-      api-version: 2024-12-01-preview
-
-  lmstudio:
-    base_url: http://localhost:1234/v1
-
-  ollama:
-    base_url: http://localhost:11434/v1
-
-  vllm:
-    base_url: http://localhost:8000/v1
-
   llamacpp:
-    base_url: http://localhost:8080/v1
+    base_url: http://127.0.0.1:8080/v1
 
 models:
-  openai/gpt-5.5:
-    reasoning_effort: high
-    verbosity: medium
-
-  openrouter/~anthropic/claude-opus-latest:
-    tools:
-      - type: openrouter:web_search
-      - type: openrouter:web_fetch
-
-  ollama/llama4:
-
-  # llama-server production example. Context-management values are deliberately
-  # required instead of silently defaulted: derive them from the actual runtime/model contract.
-  # llamacpp/<model-alias>:
-  #   context_management:
-  #     context_window_tokens: auto  # reads /props -> default_generation_settings.n_ctx
-  #     max_output_tokens: <required>
-  #     safety_margin_tokens: <required>
-  #     compaction_trigger_tokens: <required>  # start compaction before the hard limit
-  #     compaction_target_tokens: <required>   # target size after compaction; must be below trigger
-  #     recent_messages: <required>
-  #     compaction_max_output_tokens: <required>
-  #     # token_count_url: http://localhost:8080/v1/chat/completions/input_tokens
-  #     # props_url: http://localhost:8080/props
+  llamacpp/ornith-1.5-9b-q6_k:
+    context_management:
+      context_window_tokens: 32768
+      max_output_tokens: 4096
+      safety_margin_tokens: 1024
+      compaction_trigger_tokens: 26000
+      compaction_target_tokens: 18000
+      recent_messages: 4
+      compaction_max_output_tokens: 2048
 
 system_prompt: |
   You are a snarky Discord chatbot. Be informative but harsh.
