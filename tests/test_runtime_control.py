@@ -7,6 +7,7 @@ from runtime_control import (
     InferenceGate,
     InferenceQueueFull,
     InferenceQueueTimeout,
+    InferenceUnavailable,
     RuntimeControlError,
     RuntimePolicy,
     stream_with_timeouts,
@@ -68,6 +69,32 @@ class RuntimeControlTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(InferenceQueueTimeout):
             await gate.acquire()
         await first.release()
+        self.assertEqual(0, (await gate.snapshot())["in_system"])
+
+    async def test_health_control_can_close_and_reopen_admission(self):
+        gate = InferenceGate(self.policy())
+        await gate.set_accepting(False)
+
+        with self.assertRaises(InferenceUnavailable):
+            await gate.acquire()
+
+        self.assertFalse((await gate.snapshot())["accepting"])
+        await gate.set_accepting(True)
+        lease = await gate.acquire()
+        await lease.release()
+        self.assertTrue((await gate.snapshot())["accepting"])
+
+    async def test_queued_request_does_not_start_after_admission_closes(self):
+        gate = InferenceGate(self.policy(queue_wait_timeout_seconds=0.5))
+        first = await gate.acquire()
+        queued = asyncio.create_task(gate.acquire())
+        await asyncio.sleep(0)
+
+        await gate.set_accepting(False)
+        await first.release()
+
+        with self.assertRaises(InferenceUnavailable):
+            await queued
         self.assertEqual(0, (await gate.snapshot())["in_system"])
 
     async def test_lease_releases_after_exception(self):
