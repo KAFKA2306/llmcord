@@ -9,6 +9,6 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev
 
-COPY llmcord.py context_management.py runtime_control.py config.yaml ./
+COPY llmcord.py backend_probe.py backend_watchdog.py context_management.py runtime_control.py config.yaml ./
 
 CMD ["uv", "run", "--locked", "--no-sync", "python", "llmcord.py"]
