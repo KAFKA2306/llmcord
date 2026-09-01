@@ -7,6 +7,7 @@ from runtime_control import (
     InferenceGate,
     InferenceQueueFull,
     InferenceQueueTimeout,
+    InferenceUnavailable,
     RuntimeControlError,
     RuntimePolicy,
     stream_with_timeouts,
@@ -69,6 +70,35 @@ class RuntimeControlTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(InferenceQueueTimeout):
             await gate.acquire()
         await first.release()
+        self.assertEqual(0, (await gate.snapshot())["in_system"])
+
+    async def test_admission_check_rejects_before_entering_queue(self):
+        gate = InferenceGate(self.policy())
+
+        async def admission_check():
+            return False
+
+        with self.assertRaises(InferenceUnavailable):
+            await gate.acquire(admission_check=admission_check)
+
+        self.assertEqual(0, (await gate.snapshot())["in_system"])
+
+    async def test_queued_work_is_rejected_if_health_gate_closes_before_start(self):
+        gate = InferenceGate(self.policy(queue_wait_timeout_seconds=0.5))
+        accepting = True
+
+        async def admission_check():
+            return accepting
+
+        first = await gate.acquire(admission_check=admission_check)
+        queued = asyncio.create_task(gate.acquire(admission_check=admission_check))
+        await asyncio.sleep(0)
+
+        accepting = False
+        await first.release()
+
+        with self.assertRaises(InferenceUnavailable):
+            await queued
         self.assertEqual(0, (await gate.snapshot())["in_system"])
 
     async def test_lease_releases_after_exception(self):
