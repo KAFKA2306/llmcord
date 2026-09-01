@@ -97,6 +97,16 @@ class ProductionRuntimeTests(unittest.TestCase):
         self.assertNotIn("/app/", binary)
         self.assertNotIn("/app/", model_path)
 
+    def test_systemd_units_are_the_only_checked_in_supervisor_path(self) -> None:
+        backend_unit = Path("ops/systemd/llmcord-llama-server.service").read_text(encoding="utf-8")
+        bot_unit = Path("ops/systemd/llmcord.service").read_text(encoding="utf-8")
+        self.assertIn("production_runtime.py serve --config config.yaml", backend_unit)
+        self.assertIn("KillMode=control-group", backend_unit)
+        self.assertIn("Wants=network-online.target llmcord-llama-server.service", bot_unit)
+        self.assertIn("EnvironmentFile=-%h/.config/llmcord/llmcord.env", bot_unit)
+        self.assertFalse(Path("Dockerfile").exists())
+        self.assertFalse(Path("docker-compose.yaml").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
