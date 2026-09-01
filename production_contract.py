@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import subprocess
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
@@ -16,14 +17,15 @@ class ProductionContractError(RuntimeError):
 
 
 _PLACEHOLDER_RE = re.compile(r"[<>]|\b(todo|tbd|placeholder)\b", re.IGNORECASE)
-_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-_FORBIDDEN_FLOATING = {"latest", "main", "master", "head", "nightly"}
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_REVISION_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_RELEASE_RE = re.compile(r"^v\d+\.\d+\.\d+$")
 _ALLOWED_NETWORK_MODES = {"native", "wsl", "docker"}
 _ALLOWED_SUPERVISORS = {"systemd", "docker-compose", "windows-service", "external"}
 
 
 def resolve_env(node: Any) -> Any:
-    """Resolve config keys ending in `_env` with the same semantics as llmcord.py."""
     if isinstance(node, dict):
         resolved: dict[str, Any] = {}
         for key, value in node.items():
@@ -61,13 +63,6 @@ def _required_text(mapping: Mapping[str, Any], key: str, prefix: str) -> str:
     return value
 
 
-def _pinned_text(mapping: Mapping[str, Any], key: str, prefix: str) -> str:
-    value = _required_text(mapping, key, prefix)
-    if value.lower() in _FORBIDDEN_FLOATING or value.lower().endswith(":latest"):
-        raise ProductionContractError(f"{prefix}.{key} must be pinned, not {value!r}")
-    return value
-
-
 def _positive_int(mapping: Mapping[str, Any], key: str, prefix: str) -> int:
     value = mapping.get(key)
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -90,26 +85,30 @@ def _normalize_endpoint(value: str) -> str:
 
 def _validate_endpoint(endpoint: str, network_mode: str) -> str:
     parsed = urlparse(endpoint)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ProductionContractError("production.network.endpoint must be an absolute http(s) URL")
+    if parsed.scheme != "http" or not parsed.hostname or parsed.path.rstrip("/") != "/v1":
+        raise ProductionContractError("production.network.endpoint must be an absolute http URL ending in /v1")
     host = parsed.hostname.lower()
     if host in {"0.0.0.0", "::"}:
-        raise ProductionContractError("production.network.endpoint must not use a wildcard listen address")
+        raise ProductionContractError("production.network.endpoint must not use a wildcard address")
+    if network_mode in {"native", "wsl"} and host not in {"localhost", "127.0.0.1", "::1"}:
+        raise ProductionContractError("native/WSL production endpoint must be loopback-only")
     if network_mode == "docker" and host in {"localhost", "127.0.0.1", "::1"}:
-        raise ProductionContractError(
-            "production.network.endpoint must not use localhost in Docker mode; use the backend service/DNS name"
-        )
+        raise ProductionContractError("Docker production endpoint must use a service/DNS name, not localhost")
     return _normalize_endpoint(endpoint)
 
 
 @dataclass(frozen=True)
 class ProductionContract:
     backend: str
+    backend_release: str
     backend_version_or_commit: str
+    backend_executable: str
     model: str
     model_upstream: str
+    artifact_repo: str
     model_artifact: str
     model_revision: str
+    artifact_url: str
     model_sha256: str
     quantization_or_dtype: str
     context_window_tokens: int
@@ -121,10 +120,14 @@ class ProductionContract:
     gpu_device_index: int | None
     min_vram_used_mib: int | None
     gpu_process_name_pattern: str | None
-    artifact_path: str | None
+    artifact_path: str
 
 
-def validate_production_contract(config: Mapping[str, Any]) -> ProductionContract | None:
+def validate_production_contract(
+    config: Mapping[str, Any],
+    *,
+    verify_artifact: bool = True,
+) -> ProductionContract | None:
     production = config.get("production")
     if production is None:
         return None
@@ -136,7 +139,16 @@ def validate_production_contract(config: Mapping[str, Any]) -> ProductionContrac
         return None
 
     backend = _required_text(production, "backend", "production")
-    backend_version = _pinned_text(production, "backend_version_or_commit", "production")
+    backend_release = _required_text(production, "backend_release", "production")
+    if _RELEASE_RE.fullmatch(backend_release) is None:
+        raise ProductionContractError("production.backend_release must be an explicit vX.Y.Z release")
+    backend_version = _required_text(production, "backend_version_or_commit", "production")
+    if _GIT_COMMIT_RE.fullmatch(backend_version) is None:
+        raise ProductionContractError("production.backend_version_or_commit must be a full commit SHA")
+    backend_executable = _required_text(production, "backend_executable", "production")
+    if backend == "llamacpp" and Path(os.path.expanduser(backend_executable)).name != "llama-server":
+        raise ProductionContractError("llamacpp production.backend_executable must name llama-server")
+
     model = _required_text(production, "model", "production")
     if "/" not in model:
         raise ProductionContractError("production.model must use <provider>/<model> form")
@@ -146,17 +158,23 @@ def validate_production_contract(config: Mapping[str, Any]) -> ProductionContrac
 
     model_cfg = _mapping(production.get("model_artifact"), "production.model_artifact")
     model_upstream = _required_text(model_cfg, "upstream", "production.model_artifact")
+    artifact_repo = _required_text(model_cfg, "artifact_repo", "production.model_artifact")
     artifact = _required_text(model_cfg, "artifact", "production.model_artifact")
-    revision = _pinned_text(model_cfg, "revision", "production.model_artifact")
+    revision = _required_text(model_cfg, "revision", "production.model_artifact")
+    if _GIT_REVISION_RE.fullmatch(revision) is None:
+        raise ProductionContractError("production.model_artifact.revision must be a pinned git revision")
+    artifact_url = _required_text(model_cfg, "artifact_url", "production.model_artifact")
+    expected_url = f"https://huggingface.co/{artifact_repo}/resolve/{revision}/{artifact}"
+    if artifact_url != expected_url:
+        raise ProductionContractError("production.model_artifact.artifact_url must match repo/revision/artifact")
     sha256 = _required_text(model_cfg, "sha256", "production.model_artifact")
-    if not _SHA256_RE.fullmatch(sha256):
-        raise ProductionContractError("production.model_artifact.sha256 must be a 64-character SHA-256 digest")
+    if _SHA256_RE.fullmatch(sha256) is None:
+        raise ProductionContractError("production.model_artifact.sha256 must be 64 lowercase hex characters")
     quantization = _required_text(model_cfg, "quantization_or_dtype", "production.model_artifact")
     context_window = _positive_int(model_cfg, "context_window_tokens", "production.model_artifact")
-    artifact_path_value = model_cfg.get("verify_path")
-    if artifact_path_value is not None and (not isinstance(artifact_path_value, str) or not artifact_path_value.strip()):
-        raise ProductionContractError("production.model_artifact.verify_path must be a non-empty string when set")
-    artifact_path = artifact_path_value.strip() if isinstance(artifact_path_value, str) else None
+    artifact_path = _required_text(model_cfg, "verify_path", "production.model_artifact")
+    if Path(os.path.expanduser(artifact_path)).name != artifact:
+        raise ProductionContractError("production.model_artifact.verify_path must end with the pinned artifact filename")
 
     network = _mapping(production.get("network"), "production.network")
     network_mode = _required_text(network, "mode", "production.network").lower()
@@ -186,64 +204,60 @@ def validate_production_contract(config: Mapping[str, Any]) -> ProductionContrac
         if not isinstance(min_vram_used_mib, int) or isinstance(min_vram_used_mib, bool) or min_vram_used_mib <= 0:
             raise ProductionContractError("production.gpu.min_vram_used_mib must be a positive integer")
         try:
-            re.compile(gpu_process_name_pattern, re.IGNORECASE)
+            pattern = re.compile(gpu_process_name_pattern, re.IGNORECASE)
         except re.error as exc:
             raise ProductionContractError(f"production.gpu.process_name_pattern is invalid: {exc}") from exc
+        if backend == "llamacpp" and pattern.search(Path(os.path.expanduser(backend_executable)).name) is None:
+            raise ProductionContractError("production GPU process pattern must match the pinned llama-server executable")
 
     providers = _mapping(config.get("providers"), "providers")
+    if set(providers) != {backend}:
+        raise ProductionContractError("production config must expose exactly one selected provider")
     provider = _mapping(providers.get(backend), f"providers.{backend}")
     configured_endpoint = _required_text(provider, "base_url", f"providers.{backend}")
     if _normalize_endpoint(configured_endpoint) != endpoint:
-        raise ProductionContractError(
-            f"providers.{backend}.base_url must exactly match production.network.endpoint"
-        )
+        raise ProductionContractError(f"providers.{backend}.base_url must exactly match production.network.endpoint")
 
     models = _mapping(config.get("models"), "models")
-    if model not in models:
-        raise ProductionContractError("production.model must exist in models")
-    first_model = next(iter(models), None)
-    if first_model != model:
-        raise ProductionContractError(
-            "production.model must be the first configured model because llmcord currently selects the first model at startup"
-        )
+    if set(models) != {model}:
+        raise ProductionContractError("production config must expose exactly one selected model")
     model_runtime_cfg = _mapping(models.get(model) or {}, f"models.{model}")
     context_cfg = _mapping(model_runtime_cfg.get("context_management"), f"models.{model}.context_management")
-    runtime_context_window = context_cfg.get("context_window_tokens")
-    if runtime_context_window not in {"auto", context_window}:
-        raise ProductionContractError(
-            f"models.{model}.context_management.context_window_tokens must be 'auto' or match production context_window_tokens"
-        )
+    if context_cfg.get("context_window_tokens") != context_window:
+        raise ProductionContractError("runtime context_window_tokens must exactly match production model artifact context")
+
+    runtime_control = _mapping(config.get("runtime_control"), "runtime_control")
+    if runtime_control.get("max_concurrency") != 1:
+        raise ProductionContractError("production runtime_control.max_concurrency must be 1")
+    if config.get("max_images") != 0:
+        raise ProductionContractError("production image input must remain disabled until an mmproj artifact is pinned")
 
     health = _mapping(config.get("health_control"), "health_control")
-    if health.get("enabled") is not True:
-        raise ProductionContractError("health_control.enabled must be true in production")
-    if health.get("model") != model:
-        raise ProductionContractError("health_control.model must exactly match production.model")
-    health_restart = tuple(health.get("restart_command") or ())
-    if health_restart != restart_command:
-        raise ProductionContractError(
-            "health_control.restart_command must exactly match production.supervisor.restart_command"
-        )
-
+    if health.get("enabled") is not True or health.get("model") != model:
+        raise ProductionContractError("health_control must be enabled for the selected production model")
+    if tuple(health.get("restart_command") or ()) != restart_command:
+        raise ProductionContractError("health_control.restart_command must exactly match production supervisor")
     gpu_health = _mapping(health.get("nvidia_gpu") or {}, "health_control.nvidia_gpu")
     if gpu_required:
         if gpu_health.get("enabled") is not True:
-            raise ProductionContractError("health_control.nvidia_gpu.enabled must be true when production GPU is required")
+            raise ProductionContractError("health_control.nvidia_gpu.enabled must be true in GPU production")
         if gpu_health.get("device_index") != gpu_device_index:
-            raise ProductionContractError("health_control.nvidia_gpu.device_index must match production.gpu.device_index")
+            raise ProductionContractError("health GPU device must match production GPU device")
         if gpu_health.get("min_vram_used_mib") != min_vram_used_mib:
-            raise ProductionContractError(
-                "health_control.nvidia_gpu.min_vram_used_mib must match production.gpu.min_vram_used_mib"
-            )
+            raise ProductionContractError("health GPU VRAM floor must match production GPU contract")
 
     contract = ProductionContract(
         backend=backend,
+        backend_release=backend_release,
         backend_version_or_commit=backend_version,
+        backend_executable=backend_executable,
         model=model,
         model_upstream=model_upstream,
+        artifact_repo=artifact_repo,
         model_artifact=artifact,
         model_revision=revision,
-        model_sha256=sha256.lower(),
+        artifact_url=artifact_url,
+        model_sha256=sha256,
         quantization_or_dtype=quantization,
         context_window_tokens=context_window,
         network_mode=network_mode,
@@ -256,25 +270,44 @@ def validate_production_contract(config: Mapping[str, Any]) -> ProductionContrac
         gpu_process_name_pattern=gpu_process_name_pattern,
         artifact_path=artifact_path,
     )
-
-    if artifact_path is not None:
+    if verify_artifact:
         verify_model_artifact(contract)
-
     return contract
 
 
 def verify_model_artifact(contract: ProductionContract) -> None:
-    if contract.artifact_path is None:
-        return
-    path = Path(contract.artifact_path)
+    path = Path(os.path.expanduser(contract.artifact_path)).resolve()
     if not path.is_file():
         raise ProductionContractError(f"production model artifact is not accessible: {path}")
     digest = hashlib.sha256()
     with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+        for chunk in iter(lambda: file.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     actual = digest.hexdigest()
     if actual != contract.model_sha256:
         raise ProductionContractError(
             f"production model artifact hash mismatch: expected {contract.model_sha256}, got {actual}"
         )
+
+
+def verify_backend_executable(contract: ProductionContract) -> None:
+    path = Path(os.path.expanduser(contract.backend_executable)).resolve()
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ProductionContractError(f"production backend executable is not runnable: {path}")
+    try:
+        completed = subprocess.run(
+            [str(path), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProductionContractError("could not execute pinned backend --version") from exc
+    output = f"{completed.stdout}\n{completed.stderr}"
+    if completed.returncode != 0:
+        raise ProductionContractError("pinned backend --version returned non-zero")
+    if contract.backend_release.removeprefix("v") not in output:
+        raise ProductionContractError("backend release does not match production.backend_release")
+    if contract.backend_version_or_commit[:9] not in output:
+        raise ProductionContractError("backend commit does not match production.backend_version_or_commit")
