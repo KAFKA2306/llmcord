@@ -41,7 +41,9 @@ production:
 status_message:
 
 max_text: 100000
-max_images: 5
+# No mmproj artifact is pinned in the production contract. Keep image input disabled
+# rather than silently routing unsupported multimodal requests to llama-server.
+max_images: 0
 max_messages: 25
 
 runtime_control:
