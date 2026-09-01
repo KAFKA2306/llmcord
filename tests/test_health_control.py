@@ -1,7 +1,15 @@
 import asyncio
 import unittest
 
-from health_control import BackendState, BackendWatchdog, HealthControlError, WatchdogPolicy
+from health_control import (
+    BackendState,
+    BackendWatchdog,
+    HealthControlError,
+    WatchdogPolicy,
+    parse_nvidia_compute_processes,
+    parse_nvidia_gpu_snapshot,
+    require_expected_gpu_process,
+)
 
 
 class HealthControlTests(unittest.IsolatedAsyncioTestCase):
@@ -157,6 +165,45 @@ class HealthControlTests(unittest.IsolatedAsyncioTestCase):
         await watchdog.stop()
         await task
         self.assertEqual(0, probes)
+
+    def test_gpu_snapshot_parser(self):
+        snapshot = parse_nvidia_gpu_snapshot("GPU-abc, 14321, 77, 68\n")
+        self.assertEqual("GPU-abc", snapshot.uuid)
+        self.assertEqual(14321, snapshot.vram_used_mib)
+        self.assertEqual(77.0, snapshot.utilization_percent)
+        self.assertEqual(68.0, snapshot.temperature_c)
+
+    def test_compute_process_parser_accepts_wddm_na_memory(self):
+        processes = parse_nvidia_compute_processes(
+            "GPU-abc, 1234, C:\\tools\\llama-server.exe, [N/A]\n"
+            "GPU-def, 5678, python.exe, 1024\n"
+        )
+        self.assertEqual(2, len(processes))
+        self.assertIsNone(processes[0].used_gpu_memory_mib)
+        self.assertEqual(1024, processes[1].used_gpu_memory_mib)
+
+    def test_expected_backend_process_must_be_on_selected_gpu(self):
+        processes = parse_nvidia_compute_processes(
+            "GPU-abc, 1234, /opt/llama/llama-server, 12000\n"
+            "GPU-def, 5678, /usr/bin/python, 8000\n"
+        )
+        match = require_expected_gpu_process(
+            processes,
+            gpu_uuid="GPU-abc",
+            process_name_pattern=r"llama-server(?:\.exe)?$",
+        )
+        self.assertEqual(1234, match.pid)
+
+        with self.assertRaisesRegex(HealthControlError, "possible CPU fallback"):
+            require_expected_gpu_process(
+                processes,
+                gpu_uuid="GPU-def",
+                process_name_pattern=r"llama-server(?:\.exe)?$",
+            )
+
+    def test_invalid_gpu_process_pattern_fails_loudly(self):
+        with self.assertRaisesRegex(HealthControlError, "invalid GPU process_name_pattern"):
+            require_expected_gpu_process([], gpu_uuid="GPU-abc", process_name_pattern="[")
 
     def test_invalid_policy_fails_loudly(self):
         with self.assertRaises(HealthControlError):
