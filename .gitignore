@@ -10,9 +10,7 @@
 !*.md
 !*.py
 
-!Dockerfile
 !config.yaml
-!docker-compose.yaml
 
 !.github/
 !.github/workflows/

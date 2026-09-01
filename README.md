@@ -137,6 +137,47 @@ fail loudly にする対象:
 - watchdog model / restart / GPU projection drift
 - `mmproj` 未固定での image input 有効化
 
+### WSL2 runtime evidence
+
+#13 の実機 startup/restart 証拠は `runtime_evidence.py` で取得する。CI や mock を実機 evidence として代用しない。
+
+```bash
+cd ~/llmcord
+git switch main
+git pull --ff-only
+uv sync --locked
+
+uv run --locked --no-sync python runtime_evidence.py \
+  --exercise-restart \
+  --output evidence/runtime.json
+```
+
+collector は次を自動確認する。
+
+- git が `main` かつ clean
+- WSL2 であること
+- pinned backend binary / release / commit
+- pinned GGUF SHA256
+- systemd user backend / bot service が `active/running`
+- selected GPU 上に expected `llama-server` compute process が存在
+- synthetic `/v1/chat/completions` が exact `PONG`
+- manifest 固定の backend restart command 後に backend PID が変わる
+- backend-only restart 中に bot PID が変わらない
+- restart 後も GPU attribution + synthetic generation が再び healthy
+
+結果は machine-readable JSON。`pass_with_rollback_unverified` は startup/restart が実証済みで、rollback だけが未実証という意味。collector 自体は git checkout を自動実行しない。
+
+既知の旧 verified runtime を rollback target として記録する場合:
+
+```bash
+uv run --locked --no-sync python runtime_evidence.py \
+  --exercise-restart \
+  --rollback-commit <verified-main-commit> \
+  --output evidence/runtime-before-rollback.json
+```
+
+この指定だけでは rollback 済みとは判定しない。下記 rollback 手順を実行後、旧 commit 側でも collector を再実行し、その JSON を rollback evidence とする。
+
 ## Runtime contract
 
 ```text
@@ -165,6 +206,8 @@ recent_verbatim_messages = 4
 
 Discord message本文、prompt、system prompt、attachment本文、response本文、API key、Authorization、Discord token、user ID は観測ログに出さない。分類不能 log も元本文を捨てる。この event stream は #14 の障害注入・soak evidence に使う。
 
+#14 の failure-injection / 24h soak evidence は `acceptance.py` が機械的に採点する。`runtime_evidence.py` は #13 の実 runtime identity/startup/restart の収集器で、責務を重複させない。
+
 ## Rollback
 
 ```bash
@@ -174,9 +217,13 @@ uv sync --locked
 uv run --locked --no-sync python production_backend.py check
 systemctl --user daemon-reload
 systemctl --user restart llmcord-llama-server.service llmcord.service
+
+uv run --locked --no-sync python runtime_evidence.py \
+  --exercise-restart \
+  --output evidence/runtime-after-rollback.json
 ```
 
-その commit の `config.yaml` に固定された backend commit / model SHA256 と実体が一致するまで production-ready と扱わない。
+その commit の `config.yaml` に固定された backend commit / model SHA256 と実体が一致し、rollback 後の runtime evidence が startup/restart `pass` になるまで production-ready と扱わない。
 
 ## CI
 
@@ -185,9 +232,9 @@ uv lock --check
 uv sync --locked
 uv run --locked --no-sync python -m py_compile \
   llmcord.py backend_probe.py context_management.py runtime_control.py health_control.py observability.py \
-  production_contract.py production_entrypoint.py production_backend.py
+  production_contract.py production_entrypoint.py production_backend.py acceptance.py runtime_evidence.py
 uv run --locked --no-sync python production_backend.py check --static
 uv run --locked --no-sync python -m unittest discover -s tests -v
 ```
 
-CIだけでは #13 を完全に閉じない。実 WSL2/GPU で startup / restart / rollback を確認し、最終 E2E / 24h soak は #14 で行う。
+CIだけでは #13 を完全に閉じない。実 WSL2/GPU で startup / restart / rollback を確認し、最終 Discord E2E / failure injection / 24h soak は #14 で行う。
