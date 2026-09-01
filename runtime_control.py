@@ -19,6 +19,10 @@ class InferenceQueueTimeout(RuntimeControlError):
     """Raised when an admitted request waits too long for an inference slot."""
 
 
+class InferenceUnavailable(RuntimeControlError):
+    """Raised when health control has closed admission to the inference backend."""
+
+
 class GenerationTimeout(RuntimeControlError):
     def __init__(self, phase: str) -> None:
         super().__init__(f"generation timed out during {phase}")
@@ -78,16 +82,25 @@ class InferenceLease:
 
 
 class InferenceGate:
-    """Bound total accepted work and serialize GPU inference independently of Discord task creation."""
+    """Bound accepted work and expose one health-controlled admission switch."""
 
     def __init__(self, policy: RuntimePolicy) -> None:
         self.policy = policy
         self._semaphore = asyncio.Semaphore(policy.max_concurrency)
         self._state_lock = asyncio.Lock()
         self._in_system = 0
+        self._accepting = True
+
+    async def set_accepting(self, accepting: bool) -> None:
+        if not isinstance(accepting, bool):
+            raise RuntimeControlError("accepting must be a boolean")
+        async with self._state_lock:
+            self._accepting = accepting
 
     async def acquire(self) -> InferenceLease:
         async with self._state_lock:
+            if not self._accepting:
+                raise InferenceUnavailable("inference admission is closed by backend health control")
             capacity = self.policy.max_concurrency + self.policy.max_queue_size
             if self._in_system >= capacity:
                 raise InferenceQueueFull(f"inference capacity {capacity} is full")
@@ -108,6 +121,12 @@ class InferenceGate:
                 self._in_system -= 1
             raise
 
+        async with self._state_lock:
+            if not self._accepting:
+                self._in_system -= 1
+                self._semaphore.release()
+                raise InferenceUnavailable("inference admission closed while this request was queued")
+
         return InferenceLease(
             gate=self,
             queue_wait_seconds=asyncio.get_running_loop().time() - started,
@@ -121,14 +140,16 @@ class InferenceGate:
                 self._in_system = 0
                 raise RuntimeControlError("inference gate release imbalance")
 
-    async def snapshot(self) -> dict[str, int]:
+    async def snapshot(self) -> dict[str, int | bool]:
         async with self._state_lock:
             active_or_waiting = self._in_system
+            accepting = self._accepting
         return {
             "in_system": active_or_waiting,
             "capacity": self.policy.max_concurrency + self.policy.max_queue_size,
             "max_concurrency": self.policy.max_concurrency,
             "max_queue_size": self.policy.max_queue_size,
+            "accepting": accepting,
         }
 
 
