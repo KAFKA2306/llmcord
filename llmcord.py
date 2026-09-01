@@ -1,5 +1,6 @@
 import asyncio
 from base64 import b64encode
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
@@ -15,6 +16,8 @@ import httpx
 from openai import AsyncOpenAI, OpenAIError
 import yaml
 
+from backend_probe import BackendProbeConfig, probe_generation
+from backend_watchdog import BackendWatchdog, WatchdogPolicy, restart_backend_command
 from context_management import ContextManagementError, ContextPolicy, compaction_request_messages, prepare_context
 from runtime_control import (
     GenerationProtocolError,
@@ -22,6 +25,7 @@ from runtime_control import (
     InferenceGate,
     InferenceQueueFull,
     InferenceQueueTimeout,
+    InferenceUnavailable,
     RuntimePolicy,
     stream_with_timeouts,
 )
@@ -57,6 +61,86 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
 
 def _request_headers(api_key: str, extra_headers: Optional[dict[str, str]]) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", **(extra_headers or {})}
+
+
+def build_backend_watchdog(
+    app_config: dict[str, Any],
+    inference_gate: InferenceGate,
+) -> tuple[BackendWatchdog | None, str | None]:
+    watchdog_config = app_config.get("backend_watchdog")
+    if watchdog_config is None:
+        return None, None
+    if not isinstance(watchdog_config, dict):
+        raise RuntimeError("backend_watchdog configuration must be a mapping")
+    if not watchdog_config.get("enabled", False):
+        return None, None
+
+    required = (
+        "model",
+        "probe_interval_seconds",
+        "probe_timeout_seconds",
+        "failure_threshold",
+        "restart_cooldown_seconds",
+        "restart_settle_seconds",
+        "max_restart_attempts",
+        "restart_timeout_seconds",
+        "restart_command",
+    )
+    missing = [name for name in required if name not in watchdog_config]
+    if missing:
+        raise RuntimeError(f"missing backend_watchdog setting(s): {', '.join(missing)}")
+
+    watchdog_model = watchdog_config["model"]
+    if not isinstance(watchdog_model, str) or watchdog_model not in app_config["models"]:
+        raise RuntimeError("backend_watchdog.model must name one configured model")
+
+    provider, model = watchdog_model.removesuffix(":vision").split("/", 1)
+    if provider not in app_config["providers"]:
+        raise RuntimeError(f"backend_watchdog provider is not configured: {provider}")
+    provider_config = app_config["providers"][provider]
+
+    restart_command = watchdog_config["restart_command"]
+    if not isinstance(restart_command, list) or not restart_command or any(not isinstance(part, str) or not part for part in restart_command):
+        raise RuntimeError("backend_watchdog.restart_command must be a non-empty argv list")
+
+    restart_timeout_seconds = watchdog_config["restart_timeout_seconds"]
+    if isinstance(restart_timeout_seconds, bool) or not isinstance(restart_timeout_seconds, (int, float)) or restart_timeout_seconds <= 0:
+        raise RuntimeError("backend_watchdog.restart_timeout_seconds must be positive")
+
+    probe_config = BackendProbeConfig(
+        base_url=provider_config["base_url"],
+        model=model,
+        timeout_seconds=watchdog_config["probe_timeout_seconds"],
+        api_key=provider_config.get("api_key"),
+        extra_headers=provider_config.get("extra_headers"),
+        extra_query=provider_config.get("extra_query"),
+    )
+    policy = WatchdogPolicy(
+        probe_interval_seconds=watchdog_config["probe_interval_seconds"],
+        failure_threshold=watchdog_config["failure_threshold"],
+        restart_cooldown_seconds=watchdog_config["restart_cooldown_seconds"],
+        restart_settle_seconds=watchdog_config["restart_settle_seconds"],
+        max_restart_attempts=watchdog_config["max_restart_attempts"],
+    )
+
+    async def run_probe():
+        return await probe_generation(probe_config)
+
+    async def restart_backend():
+        return await restart_backend_command(
+            restart_command,
+            timeout_seconds=float(restart_timeout_seconds),
+        )
+
+    return (
+        BackendWatchdog(
+            policy,
+            probe=run_probe,
+            restart_backend=restart_backend,
+            set_accepting=inference_gate.set_accepting,
+        ),
+        watchdog_model,
+    )
 
 
 async def prepare_managed_context(
@@ -168,6 +252,9 @@ runtime_policy = RuntimePolicy(
     total_generation_timeout_seconds=runtime_config["total_generation_timeout_seconds"],
 )
 inference_gate = InferenceGate(runtime_policy)
+backend_watchdog, watchdog_model = build_backend_watchdog(config, inference_gate)
+if watchdog_model is not None:
+    curr_model = watchdog_model
 
 msg_nodes = {}
 last_task_time = 0
@@ -201,6 +288,8 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
 
     if model == curr_model:
         output = f"Current model: `{curr_model}`"
+    elif backend_watchdog is not None:
+        output = f"Model switching is disabled while the production watchdog pins `{watchdog_model}`."
     else:
         if user_is_admin := interaction.user.id in config["permissions"]["users"]["admin_ids"]:
             curr_model = model
@@ -218,6 +307,9 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
 
     if curr_str == "":
         config = await asyncio.to_thread(get_config)
+
+    if backend_watchdog is not None:
+        return [Choice(name=f"◉ {curr_model} (watchdog pinned)", value=curr_model)] if curr_str.lower() in curr_model.lower() else []
 
     choices = [Choice(name=f"◉ {curr_model} (current)", value=curr_model)] if curr_str.lower() in curr_model.lower() else []
     choices += [Choice(name=f"○ {model}", value=model) for model in config["models"] if model != curr_model and curr_str.lower() in model.lower()]
@@ -311,6 +403,10 @@ async def on_message(new_msg: discord.Message) -> None:
 
     try:
         lease = await inference_gate.acquire()
+    except InferenceUnavailable:
+        logging.warning("request_id=%s inference unavailable by backend health control", request_id)
+        await new_msg.reply("⚠️ Local LLM backend is unavailable while automatic health recovery is in progress.", silent=True)
+        return
     except InferenceQueueFull:
         logging.warning("request_id=%s inference queue full", request_id)
         await new_msg.reply("⚠️ Local LLM is busy and the bounded queue is full. This request was not accepted.", silent=True)
@@ -571,7 +667,19 @@ async def on_message(new_msg: discord.Message) -> None:
 
 
 async def main() -> None:
-    await discord_bot.start(config["bot_token"])
+    watchdog_task = None
+    if backend_watchdog is not None:
+        await backend_watchdog.initialize()
+        watchdog_task = asyncio.create_task(backend_watchdog.run_forever(), name="backend-watchdog")
+
+    try:
+        await discord_bot.start(config["bot_token"])
+    finally:
+        if watchdog_task is not None:
+            watchdog_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await watchdog_task
+        await httpx_client.aclose()
 
 
 try:
