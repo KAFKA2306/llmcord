@@ -17,7 +17,31 @@ runtime_control:
   queue_wait_timeout_seconds: 300
   connect_timeout_seconds: 10
   first_token_timeout_seconds: 300
+  stream_idle_timeout_seconds: 120
   total_generation_timeout_seconds: 1800
+
+# Optional production watchdog for one Local LLM model. When enabled, STARTING / DEGRADED /
+# RECOVERING states reject new requests for the target model until a real generation probe succeeds.
+# restart_command is argv, never a shell string. Leave it empty to detect/degrade without self-restart.
+health_control:
+  enabled: false
+  model: llamacpp/<model-alias>
+  probe_interval_seconds: 60
+  probe_timeout_seconds: 30
+  probe_prompt: "Reply exactly: PONG"
+  probe_expected_text: PONG
+  probe_max_tokens: 8
+  failure_threshold: 2
+  restart_cooldown_seconds: 60
+  post_restart_grace_seconds: 10
+  max_restart_attempts: 3
+  restart_command_timeout_seconds: 30
+  restart_command: []
+  nvidia_gpu:
+    enabled: false
+    device_index: 0
+    min_vram_used_mib: 0
+    timeout_seconds: 5
 
 use_plain_responses: false
 allow_dms: true
