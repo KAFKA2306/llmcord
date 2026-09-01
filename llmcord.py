@@ -16,6 +16,15 @@ from openai import AsyncOpenAI, OpenAIError
 import yaml
 
 from context_management import ContextManagementError, ContextPolicy, compaction_request_messages, prepare_context
+from runtime_control import (
+    GenerationProtocolError,
+    GenerationTimeout,
+    InferenceGate,
+    InferenceQueueFull,
+    InferenceQueueTimeout,
+    RuntimePolicy,
+    stream_with_timeouts,
+)
 
 load_dotenv()
 
@@ -147,6 +156,19 @@ async def prepare_managed_context(
 config = get_config()
 curr_model = next(iter(config["models"]))
 
+runtime_config = config.get("runtime_control")
+if not isinstance(runtime_config, dict):
+    raise RuntimeError("runtime_control configuration is required")
+runtime_policy = RuntimePolicy(
+    max_concurrency=runtime_config["max_concurrency"],
+    max_queue_size=runtime_config["max_queue_size"],
+    queue_wait_timeout_seconds=runtime_config["queue_wait_timeout_seconds"],
+    connect_timeout_seconds=runtime_config["connect_timeout_seconds"],
+    first_token_timeout_seconds=runtime_config["first_token_timeout_seconds"],
+    total_generation_timeout_seconds=runtime_config["total_generation_timeout_seconds"],
+)
+inference_gate = InferenceGate(runtime_policy)
+
 msg_nodes = {}
 last_task_time = 0
 
@@ -249,11 +271,20 @@ async def on_message(new_msg: discord.Message) -> None:
     provider_slash_model = curr_model
     provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
 
+    request_id = str(new_msg.id)
     provider_config = config["providers"][provider]
 
     base_url = provider_config["base_url"]
     api_key = provider_config.get("api_key", "sk-no-key-required")
-    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+    openai_client = AsyncOpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        max_retries=0,
+        timeout=httpx.Timeout(
+            runtime_policy.total_generation_timeout_seconds,
+            connect=runtime_policy.connect_timeout_seconds,
+        ),
+    )
 
     model_parameters = dict(config["models"].get(provider_slash_model) or {})
     context_config = model_parameters.pop("context_management", None)
@@ -263,7 +294,7 @@ async def on_message(new_msg: discord.Message) -> None:
         return
     context_management_enabled = bool(context_config is not None and context_config.get("enabled", True))
 
-    extra_headers = provider_config.get("extra_headers")
+    extra_headers = {**(provider_config.get("extra_headers") or {}), "X-LLMcord-Request-ID": request_id}
     extra_query = provider_config.get("extra_query")
     provider_extra_body = provider_config.get("extra_body") or {}
     if context_management_enabled and any(
@@ -278,230 +309,265 @@ async def on_message(new_msg: discord.Message) -> None:
         return
     extra_body = provider_extra_body | model_parameters or None
 
-    accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
+    try:
+        lease = await inference_gate.acquire()
+    except InferenceQueueFull:
+        logging.warning("request_id=%s inference queue full", request_id)
+        await new_msg.reply("⚠️ Local LLM is busy and the bounded queue is full. This request was not accepted.", silent=True)
+        return
+    except InferenceQueueTimeout:
+        logging.warning("request_id=%s inference queue wait timed out", request_id)
+        await new_msg.reply("⚠️ Local LLM queue wait timed out. This request was not sent.", silent=True)
+        return
 
-    max_text = config.get("max_text", 100000)
-    max_images = config.get("max_images", 5) if accept_images else 0
-    max_messages = config.get("max_messages", 25)
+    logging.info("request_id=%s inference admitted queue_wait_seconds=%.3f", request_id, lease.queue_wait_seconds)
+    try:
+        accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
 
-    # Build message chain and set user warnings. With automatic context management enabled,
-    # reply-chain length is not the context-window authority; token-aware compaction handles it later.
-    messages = []
-    user_warnings = set()
-    curr_msg = new_msg
+        max_text = config.get("max_text", 100000)
+        max_images = config.get("max_images", 5) if accept_images else 0
+        max_messages = config.get("max_messages", 25)
 
-    while curr_msg != None and (context_management_enabled or len(messages) < max_messages):
-        curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
+        # Build message chain and set user warnings. With automatic context management enabled,
+        # reply-chain length is not the context-window authority; token-aware compaction handles it later.
+        messages = []
+        user_warnings = set()
+        curr_msg = new_msg
 
-        async with curr_node.lock:
-            if curr_node.text == None:
-                cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).lstrip()
+        while curr_msg != None and (context_management_enabled or len(messages) < max_messages):
+            curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
 
-                good_attachments = [att for att in curr_msg.attachments if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))]
+            async with curr_node.lock:
+                if curr_node.text == None:
+                    cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).lstrip()
 
-                attachment_responses = await asyncio.gather(*[httpx_client.get(att.url) for att in good_attachments])
+                    good_attachments = [att for att in curr_msg.attachments if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))]
 
-                curr_node.role = "assistant" if curr_msg.author == discord_bot.user else "user"
+                    attachment_responses = await asyncio.gather(*[httpx_client.get(att.url) for att in good_attachments])
 
-                curr_node.text = "\n".join(
-                    ([cleaned_content] if cleaned_content else [])
-                    + ["\n".join(filter(None, (embed.title, embed.description, embed.footer.text))) for embed in curr_msg.embeds]
-                    + [component.content for component in curr_msg.components if component.type == discord.ComponentType.text_display]
-                    + [resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text")]
+                    curr_node.role = "assistant" if curr_msg.author == discord_bot.user else "user"
+
+                    curr_node.text = "\n".join(
+                        ([cleaned_content] if cleaned_content else [])
+                        + ["\n".join(filter(None, (embed.title, embed.description, embed.footer.text))) for embed in curr_msg.embeds]
+                        + [component.content for component in curr_msg.components if component.type == discord.ComponentType.text_display]
+                        + [resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text")]
+                    )
+
+                    curr_node.images = [
+                        dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"))
+                        for att, resp in zip(good_attachments, attachment_responses)
+                        if att.content_type.startswith("image")
+                    ]
+
+                    if curr_node.role == "user" and (curr_node.text or curr_node.images):
+                        curr_node.text = f"<@{curr_msg.author.id}>: {curr_node.text}"
+
+                    curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments)
+
+                    try:
+                        if (
+                            curr_msg.reference == None
+                            and discord_bot.user.mention not in curr_msg.content
+                            and (prev_msg_in_channel := ([m async for m in curr_msg.channel.history(before=curr_msg, limit=1)] or [None])[0])
+                            and prev_msg_in_channel.type in (discord.MessageType.default, discord.MessageType.reply)
+                            and prev_msg_in_channel.author == (discord_bot.user if curr_msg.channel.type == discord.ChannelType.private else curr_msg.author)
+                        ):
+                            curr_node.parent_msg = prev_msg_in_channel
+                        else:
+                            is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
+                            parent_is_thread_start = is_public_thread and curr_msg.reference == None and curr_msg.channel.parent.type == discord.ChannelType.text
+
+                            if parent_msg_id := curr_msg.channel.id if parent_is_thread_start else getattr(curr_msg.reference, "message_id", None):
+                                if parent_is_thread_start:
+                                    curr_node.parent_msg = curr_msg.channel.starter_message or await curr_msg.channel.parent.fetch_message(parent_msg_id)
+                                else:
+                                    curr_node.parent_msg = curr_msg.reference.cached_message or await curr_msg.channel.fetch_message(parent_msg_id)
+
+                    except (discord.NotFound, discord.HTTPException):
+                        logging.exception("Error fetching next message in the chain")
+                        curr_node.fetch_parent_failed = True
+
+                text = curr_node.text if context_management_enabled else curr_node.text[:max_text]
+                if curr_node.images[:max_images]:
+                    content = [dict(type="text", text=text)] + curr_node.images[:max_images]
+                else:
+                    content = text
+
+                if content != "":
+                    messages.append(dict(content=content, role=curr_node.role))
+
+                if not context_management_enabled and len(curr_node.text) > max_text:
+                    user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
+                if len(curr_node.images) > max_images:
+                    user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
+                if curr_node.has_bad_attachments:
+                    user_warnings.add("⚠️ Unsupported attachments")
+                if curr_node.fetch_parent_failed or (
+                    not context_management_enabled and curr_node.parent_msg != None and len(messages) == max_messages
+                ):
+                    user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
+
+                curr_msg = curr_node.parent_msg
+
+        logging.info(f"request_id={request_id} Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
+
+        if system_prompt := config.get("system_prompt"):
+            now = datetime.now().astimezone()
+
+            system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
+
+            messages.append(dict(role="system", content=system_prompt))
+
+        request_messages = messages[::-1]
+        managed_max_output_tokens = None
+        context_notice = None
+
+        if context_management_enabled:
+            try:
+                (
+                    request_messages,
+                    compacted,
+                    compacted_current_input,
+                    input_tokens_before,
+                    input_tokens_after,
+                    managed_max_output_tokens,
+                ) = await prepare_managed_context(
+                    messages=request_messages,
+                    context_config=context_config,
+                    http_client=httpx_client,
+                    openai_client=openai_client,
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=model,
+                    extra_headers=extra_headers,
+                    extra_query=extra_query,
+                )
+            except (ContextManagementError, httpx.HTTPError, OpenAIError) as exc:
+                logging.exception("Context management failed")
+                await new_msg.reply(
+                    f"⚠️ Context management could not safely prepare this request. The request was not sent. ({type(exc).__name__})",
+                    silent=True,
+                )
+                return
+
+            if compacted:
+                context_notice = "ℹ️ Long conversation history was automatically compacted"
+                user_warnings.add(context_notice)
+                logging.info(
+                    "Context compacted (input tokens: %s -> %s, current input compacted: %s)",
+                    input_tokens_before,
+                    input_tokens_after,
+                    compacted_current_input,
                 )
 
-                curr_node.images = [
-                    dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"))
-                    for att, resp in zip(good_attachments, attachment_responses)
-                    if att.content_type.startswith("image")
-                ]
+        # Generate and send response message(s) (can be multiple if response is long)
+        curr_content = finish_reason = None
+        response_msgs = []
+        response_contents = []
 
-                if curr_node.role == "user" and (curr_node.text or curr_node.images):
-                    curr_node.text = f"<@{curr_msg.author.id}>: {curr_node.text}"
+        openai_kwargs = dict(model=model, messages=request_messages, stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
+        if managed_max_output_tokens is not None:
+            openai_kwargs["max_tokens"] = managed_max_output_tokens
 
-                curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments)
+        if use_plain_responses := config.get("use_plain_responses", False):
+            max_message_length = 4000
+        else:
+            max_message_length = 4096 - len(STREAMING_INDICATOR)
+            embed = discord.Embed.from_dict(dict(fields=[dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)]))
 
-                try:
-                    if (
-                        curr_msg.reference == None
-                        and discord_bot.user.mention not in curr_msg.content
-                        and (prev_msg_in_channel := ([m async for m in curr_msg.channel.history(before=curr_msg, limit=1)] or [None])[0])
-                        and prev_msg_in_channel.type in (discord.MessageType.default, discord.MessageType.reply)
-                        and prev_msg_in_channel.author == (discord_bot.user if curr_msg.channel.type == discord.ChannelType.private else curr_msg.author)
-                    ):
-                        curr_node.parent_msg = prev_msg_in_channel
-                    else:
-                        is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
-                        parent_is_thread_start = is_public_thread and curr_msg.reference == None and curr_msg.channel.parent.type == discord.ChannelType.text
+        async def reply_helper(**reply_kwargs) -> None:
+            reply_target = new_msg if not response_msgs else response_msgs[-1]
+            response_msg = await reply_target.reply(**reply_kwargs)
+            response_msgs.append(response_msg)
 
-                        if parent_msg_id := curr_msg.channel.id if parent_is_thread_start else getattr(curr_msg.reference, "message_id", None):
-                            if parent_is_thread_start:
-                                curr_node.parent_msg = curr_msg.channel.starter_message or await curr_msg.channel.parent.fetch_message(parent_msg_id)
-                            else:
-                                curr_node.parent_msg = curr_msg.reference.cached_message or await curr_msg.channel.fetch_message(parent_msg_id)
+            msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+            await msg_nodes[response_msg.id].lock.acquire()
 
-                except (discord.NotFound, discord.HTTPException):
-                    logging.exception("Error fetching next message in the chain")
-                    curr_node.fetch_parent_failed = True
+        async def create_generation_stream():
+            return await openai_client.chat.completions.create(**openai_kwargs)
 
-            text = curr_node.text if context_management_enabled else curr_node.text[:max_text]
-            if curr_node.images[:max_images]:
-                content = [dict(type="text", text=text)] + curr_node.images[:max_images]
-            else:
-                content = text
+        def is_generation_signal(chunk: Any) -> bool:
+            if not chunk.choices:
+                return False
+            choice = chunk.choices[0]
+            return choice.finish_reason is not None or bool(choice.delta.content)
 
-            if content != "":
-                messages.append(dict(content=content, role=curr_node.role))
-
-            if not context_management_enabled and len(curr_node.text) > max_text:
-                user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
-            if len(curr_node.images) > max_images:
-                user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
-            if curr_node.has_bad_attachments:
-                user_warnings.add("⚠️ Unsupported attachments")
-            if curr_node.fetch_parent_failed or (
-                not context_management_enabled and curr_node.parent_msg != None and len(messages) == max_messages
-            ):
-                user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
-
-            curr_msg = curr_node.parent_msg
-
-    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
-
-    if system_prompt := config.get("system_prompt"):
-        now = datetime.now().astimezone()
-
-        system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
-
-        messages.append(dict(role="system", content=system_prompt))
-
-    request_messages = messages[::-1]
-    managed_max_output_tokens = None
-    context_notice = None
-
-    if context_management_enabled:
         try:
-            (
-                request_messages,
-                compacted,
-                compacted_current_input,
-                input_tokens_before,
-                input_tokens_after,
-                managed_max_output_tokens,
-            ) = await prepare_managed_context(
-                messages=request_messages,
-                context_config=context_config,
-                http_client=httpx_client,
-                openai_client=openai_client,
-                base_url=base_url,
-                api_key=api_key,
-                model=model,
-                extra_headers=extra_headers,
-                extra_query=extra_query,
-            )
-        except (ContextManagementError, httpx.HTTPError, OpenAIError) as exc:
-            logging.exception("Context management failed")
-            await new_msg.reply(
-                f"⚠️ Context management could not safely prepare this request. The request was not sent. ({type(exc).__name__})",
-                silent=True,
-            )
-            return
+            async with new_msg.channel.typing():
+                async for chunk in stream_with_timeouts(
+                    create_generation_stream,
+                    first_signal=is_generation_signal,
+                    first_token_timeout_seconds=runtime_policy.first_token_timeout_seconds,
+                    total_generation_timeout_seconds=runtime_policy.total_generation_timeout_seconds,
+                ):
+                    if finish_reason != None:
+                        break
 
-        if compacted:
-            context_notice = "ℹ️ Long conversation history was automatically compacted"
-            user_warnings.add(context_notice)
-            logging.info(
-                "Context compacted (input tokens: %s -> %s, current input compacted: %s)",
-                input_tokens_before,
-                input_tokens_after,
-                compacted_current_input,
-            )
+                    if not (choice := chunk.choices[0] if chunk.choices else None):
+                        continue
 
-    # Generate and send response message(s) (can be multiple if response is long)
-    curr_content = finish_reason = None
-    response_msgs = []
-    response_contents = []
+                    finish_reason = choice.finish_reason
 
-    openai_kwargs = dict(model=model, messages=request_messages, stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
-    if managed_max_output_tokens is not None:
-        openai_kwargs["max_tokens"] = managed_max_output_tokens
+                    prev_content = curr_content or ""
+                    curr_content = choice.delta.content or ""
 
-    if use_plain_responses := config.get("use_plain_responses", False):
-        max_message_length = 4000
-    else:
-        max_message_length = 4096 - len(STREAMING_INDICATOR)
-        embed = discord.Embed.from_dict(dict(fields=[dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)]))
+                    new_content = prev_content if finish_reason == None else (prev_content + curr_content)
 
-    async def reply_helper(**reply_kwargs) -> None:
-        reply_target = new_msg if not response_msgs else response_msgs[-1]
-        response_msg = await reply_target.reply(**reply_kwargs)
-        response_msgs.append(response_msg)
+                    if response_contents == [] and new_content == "":
+                        continue
 
-        msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
-        await msg_nodes[response_msg.id].lock.acquire()
+                    if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
+                        response_contents.append("")
 
-    try:
-        async with new_msg.channel.typing():
-            async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
-                if finish_reason != None:
-                    break
+                    response_contents[-1] += new_content
 
-                if not (choice := chunk.choices[0] if chunk.choices else None):
-                    continue
+                    if not use_plain_responses:
+                        time_delta = datetime.now().timestamp() - last_task_time
 
-                finish_reason = choice.finish_reason
+                        ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
+                        msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
+                        is_final_edit = finish_reason != None or msg_split_incoming
+                        is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
 
-                prev_content = curr_content or ""
-                curr_content = choice.delta.content or ""
+                        if start_next_msg or ready_to_edit or is_final_edit:
+                            embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
+                            embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
 
-                new_content = prev_content if finish_reason == None else (prev_content + curr_content)
+                            if start_next_msg:
+                                await reply_helper(embed=embed, silent=True)
+                            else:
+                                await asyncio.sleep(EDIT_DELAY_SECONDS - time_delta)
+                                await response_msgs[-1].edit(embed=embed)
 
-                if response_contents == [] and new_content == "":
-                    continue
+                            last_task_time = datetime.now().timestamp()
 
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
-                    response_contents.append("")
+                if use_plain_responses:
+                    for index, content in enumerate(response_contents):
+                        if index == 0 and context_notice:
+                            content = f"{context_notice}\n\n{content}"
+                        await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
 
-                response_contents[-1] += new_content
+        except GenerationTimeout as exc:
+            logging.exception("request_id=%s Generation timeout phase=%s", request_id, exc.phase)
+            await new_msg.reply(f"⚠️ Local LLM timed out during {exc.phase}. The request stopped safely.", silent=True)
+        except GenerationProtocolError:
+            logging.exception("request_id=%s Generation stream ended before a usable response", request_id)
+            await new_msg.reply("⚠️ Local LLM ended the stream before producing a usable response.", silent=True)
+        except Exception:
+            logging.exception("request_id=%s Error while generating response", request_id)
 
-                if not use_plain_responses:
-                    time_delta = datetime.now().timestamp() - last_task_time
+        for response_msg in response_msgs:
+            msg_nodes[response_msg.id].text = "".join(response_contents)
+            msg_nodes[response_msg.id].lock.release()
 
-                    ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
-                    is_final_edit = finish_reason != None or msg_split_incoming
-                    is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
-
-                    if start_next_msg or ready_to_edit or is_final_edit:
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
-
-                        if start_next_msg:
-                            await reply_helper(embed=embed, silent=True)
-                        else:
-                            await asyncio.sleep(EDIT_DELAY_SECONDS - time_delta)
-                            await response_msgs[-1].edit(embed=embed)
-
-                        last_task_time = datetime.now().timestamp()
-
-            if use_plain_responses:
-                for index, content in enumerate(response_contents):
-                    if index == 0 and context_notice:
-                        content = f"{context_notice}\n\n{content}"
-                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
-
-    except Exception:
-        logging.exception("Error while generating response")
-
-    for response_msg in response_msgs:
-        msg_nodes[response_msg.id].text = "".join(response_contents)
-        msg_nodes[response_msg.id].lock.release()
-
-    # Delete oldest MsgNodes (lowest message IDs) from the cache
-    if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
-        for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
-            async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
-                msg_nodes.pop(msg_id, None)
+        # Delete oldest MsgNodes (lowest message IDs) from the cache
+        if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
+            for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
+                async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
+                    msg_nodes.pop(msg_id, None)
+    finally:
+        await lease.release()
 
 
 async def main() -> None:

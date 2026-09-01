@@ -12,7 +12,9 @@ Discord を OpenAI `/v1/chat/completions` 互換 LLM のフロントエンドと
 Discord
   ↓
 llmcord.py
-  ↓ OpenAI /v1/chat/completions
+  ↓ bounded admission / finite deadlines
+OpenAI /v1/chat/completions
+  ↓
 LLM API
   ├─ llama.cpp / llama-server
   ├─ Ollama
@@ -33,6 +35,10 @@ LLM API
 - テキスト・画像添付
 - user / role / channel 単位のアクセス制御
 - token-aware automatic context compaction
+- bounded inference admission / queue
+- connect / first-token / total-generation deadline
+- OpenAI SDK automatic retry disabled (`max_retries=0`)
+- Discord message ID を request ID として backend header / log へ伝播
 - `uv` による Python・依存関係管理
 
 ## セットアップ
@@ -65,6 +71,33 @@ docker compose up --build
 ```
 
 依存関係の正本は `pyproject.toml`、固定解は `uv.lock` です。`pip install` や `requirements.txt` は使用しません。
+
+## Runtime control
+
+`runtime_control` はプロセス起動時に読み込み、Local LLM へ送る処理を有限化します。
+
+```yaml
+runtime_control:
+  max_concurrency: 1
+  max_queue_size: 4
+  queue_wait_timeout_seconds: 300
+  connect_timeout_seconds: 10
+  first_token_timeout_seconds: 300
+  total_generation_timeout_seconds: 1800
+```
+
+`max_concurrency: 1` では、context compaction を含む LLM 処理を同時に1件だけ実行します。待機要求も `max_queue_size` を超えて保持しません。queue が満杯なら request を backend へ送らず Discord へ overload を明示します。queue 待機自体にも有限 timeout があります。
+
+ストリームは次の2段階で deadline を持ちます。
+
+- `first_token_timeout_seconds`: HTTP request 開始から最初の実 generation signal まで
+- `total_generation_timeout_seconds`: request 開始から stream 完了まで
+
+空のprotocol chunkだけでは first token 成功扱いにしません。timeout / cancellation / error 時は stream を close します。
+
+OpenAI Python SDK の automatic retry は `max_retries=0` とし、Discord handler / SDK / watchdog が独立に再試行する retry storm を作りません。現時点の production policy は自動再試行なしです。
+
+`runtime_control` は context window の推測値ではなく運用上の admission / deadline policy です。値を変更する場合はプロセスを再起動します。
 
 ## LLM 設定
 
@@ -162,15 +195,11 @@ backend が `/props` や llama-server の token count endpoint と異なる場�
 
 ## 現在まだ Issue #1 に残るもの
 
-自動コンパクション以外の無人運用機能は引き続き Issue #1 の対象です。
-
-- finite request timeout
-- bounded inference queue / concurrency limit
-- retry authority の一元化
 - synthetic generation probe
-- deterministic watchdog / restart storm protection
+- deterministic watchdog / backend restart
+- restart storm protection
 - GPU unavailable / CPU fallback detection
-- end-to-end request ID / observability
+- machine-readable metrics
 - 実 Local LLM を使った障害注入・soak test
 
 CI や process health だけを production 成功とは扱いません。
@@ -180,7 +209,7 @@ CI や process health だけを production 成功とは扱いません。
 ```bash
 uv lock --check
 uv sync --locked
-uv run --locked --no-sync python -m py_compile llmcord.py context_management.py
+uv run --locked --no-sync python -m py_compile llmcord.py context_management.py runtime_control.py
 uv run --locked --no-sync python -m unittest discover -s tests -v
 docker build -t llmcord:test .
 ```
@@ -188,17 +217,19 @@ docker build -t llmcord:test .
 ## ファイル
 
 ```text
-llmcord.py                     Discord Bot 本体
-context_management.py          token-aware automatic compaction
-config.yaml                    実行設定 / provider / model 定義
-pyproject.toml                 Python / 直接依存の正本
-uv.lock                        固定済み依存関係
-.python-version                Python 系列
-Dockerfile                     uv ベースのコンテナ
-Docker-compose.yaml            Compose 実行設定
-.github/workflows/ci.yml       CI
-tests/test_context_management.py  context management tests
-LICENSE.md                     MIT License
+llmcord.py                        Discord Bot 本体
+context_management.py             token-aware automatic compaction
+runtime_control.py                 bounded admission / finite stream deadlines
+config.yaml                        実行設定 / provider / model 定義
+pyproject.toml                     Python / 直接依存の正本
+uv.lock                            固定済み依存関係
+.python-version                    Python 系列
+Dockerfile                         uv ベースのコンテナ
+docker-compose.yaml                Compose 実行設定
+.github/workflows/ci.yml           CI
+tests/test_context_management.py   context management tests
+tests/test_runtime_control.py       runtime control tests
+LICENSE.md                         MIT License
 ```
 
 ## License
