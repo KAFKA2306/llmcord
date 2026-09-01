@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from enum import StrEnum
 import logging
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Sequence
 
 
 Probe = Callable[[], Awaitable[None]]
@@ -58,6 +58,87 @@ class WatchdogSnapshot:
     consecutive_failures: int
     restart_attempts: int
     last_error: Optional[str]
+
+
+async def run_restart_command(command: Sequence[str], timeout_seconds: float) -> None:
+    """Execute one explicit argv restart action without a shell."""
+
+    if not command or any(not isinstance(part, str) or not part for part in command):
+        raise HealthControlError("restart_command must be a non-empty argv list")
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        raise HealthControlError("restart command timeout must be a positive number")
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except TimeoutError as exc:
+        process.kill()
+        await process.communicate()
+        raise HealthControlError("restart command timed out") from exc
+
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip() or stdout.decode("utf-8", errors="replace").strip()
+        raise HealthControlError(f"restart command failed with exit code {process.returncode}: {detail[:500]}")
+
+
+async def check_nvidia_gpu(
+    *,
+    device_index: int,
+    min_vram_used_mib: int,
+    timeout_seconds: float,
+    executable: str = "nvidia-smi",
+) -> None:
+    """Require a visible NVIDIA GPU and an expected minimum resident VRAM footprint.
+
+    For a fixed llama-server deployment, calibrating min_vram_used_mib above the CPU-only
+    baseline makes a gross CPU fallback fail closed instead of being treated as healthy.
+    """
+
+    if not isinstance(device_index, int) or isinstance(device_index, bool) or device_index < 0:
+        raise HealthControlError("GPU device_index must be a non-negative integer")
+    if not isinstance(min_vram_used_mib, int) or isinstance(min_vram_used_mib, bool) or min_vram_used_mib < 0:
+        raise HealthControlError("min_vram_used_mib must be a non-negative integer")
+
+    process = await asyncio.create_subprocess_exec(
+        executable,
+        f"--id={device_index}",
+        "--query-gpu=uuid,memory.used,utilization.gpu,temperature.gpu",
+        "--format=csv,noheader,nounits",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except TimeoutError as exc:
+        process.kill()
+        await process.communicate()
+        raise HealthControlError("nvidia-smi timed out") from exc
+
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise HealthControlError(f"NVIDIA GPU check failed: {detail[:500]}")
+
+    line = stdout.decode("utf-8", errors="replace").strip().splitlines()
+    if len(line) != 1:
+        raise HealthControlError("NVIDIA GPU check returned an unexpected device count")
+    fields = [field.strip() for field in line[0].split(",")]
+    if len(fields) != 4 or not fields[0]:
+        raise HealthControlError("NVIDIA GPU check returned an unexpected payload")
+    try:
+        vram_used_mib = int(float(fields[1]))
+        float(fields[2])
+        float(fields[3])
+    except ValueError as exc:
+        raise HealthControlError("NVIDIA GPU metrics were not numeric") from exc
+
+    if vram_used_mib < min_vram_used_mib:
+        raise HealthControlError(
+            f"GPU VRAM residency is below the production floor: {vram_used_mib} MiB < {min_vram_used_mib} MiB"
+        )
 
 
 class BackendWatchdog:
