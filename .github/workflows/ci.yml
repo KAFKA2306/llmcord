@@ -31,7 +31,7 @@ jobs:
         run: uv sync --locked
 
       - name: Compile
-        run: uv run --locked --no-sync python -m py_compile llmcord.py backend_probe.py context_management.py runtime_control.py health_control.py observability.py production_contract.py production_entrypoint.py production_backend.py acceptance.py
+        run: uv run --locked --no-sync python -m py_compile llmcord.py backend_probe.py context_management.py runtime_control.py health_control.py observability.py production_contract.py production_entrypoint.py production_backend.py acceptance.py runtime_evidence.py
 
       - name: Validate production manifest statically
         run: uv run --locked --no-sync python production_backend.py check --static
