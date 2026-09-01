@@ -1,0 +1,18 @@
+[Unit]
+Description=llmcord Discord bot
+After=network-online.target llmcord-llama-server.service
+Wants=network-online.target llmcord-llama-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/llmcord
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+EnvironmentFile=-%h/.config/llmcord/llmcord.env
+ExecStart=/usr/bin/env uv run --locked --no-sync python production_entrypoint.py
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
