@@ -1,212 +1,223 @@
+http://127.0.0.1:8080/v1
+
 # llmcord
 
-Discord を OpenAI `/v1/chat/completions` 互換 LLM のフロントエンドとして使う Bot です。
+Discord と Local LLM を長時間無人運用するための Bot です。production 安定化の正本は https://github.com/KAFKA2306/llmcord/issues/1 です。
 
-元実装: https://github.com/jakobdylanc/llmcord
+## Production
 
-production 安定化の正本: https://github.com/KAFKA2306/llmcord/issues/1
-
-## 現在の構成
+現在の production は次の1構成だけです。
 
 ```text
 Discord
   ↓
+systemd --user: llmcord.service
+  ↓
+production_entrypoint.py
+  ↓
 llmcord
   ├─ token-aware auto compaction
-  ├─ bounded queue / concurrency
+  ├─ bounded queue / concurrency=1
   ├─ finite generation deadlines
   ├─ deterministic watchdog
-  └─ machine-readable production events
-         ↓
-OpenAI-compatible Local LLM
-         ↓
-NVIDIA GPU
+  └─ privacy-safe JSON observability
+         ↓ http://127.0.0.1:8080/v1
+systemd --user: llmcord-llama-server.service
+  ↓
+production_backend.py
+  ↓
+llama.cpp v0.3.0
+commit c1d0e7a004015f23bc0233470b747b596f29b264
+  ↓
+Ornith-1.5-9B-Q6_K.gguf
+SHA256 b6f76e74f86245b3caee014b797c10dca931c4dfdaabfb134eab655f81e4154a
+  ↓
+NVIDIA GPU 0
 ```
 
-会話履歴の正本は Discord の返信チェーンです。通常の会話用 DB は持ちません。
+production は **WSL2 native + systemd user service** です。Docker / Docker Compose は production 経路から削除しています。inference API は WSL 内 `127.0.0.1` のみに bind し、Windows host や LAN へ公開しません。
 
-## 実装済みの運用保護
+FreeToken は #7 の実機比較・24h soak・無人復旧条件を満たすまで production へ昇格しません。現時点の backend authority は llama.cpp です。
 
-- token-aware automatic context compaction
-- system/developer authority と直近会話の原文保持
-- oversized text の chunk / compact
-- context 超過時の silent truncation 禁止
-- `max_concurrency: 1` を既定とする bounded inference admission
-- bounded queue と有限 queue wait
-- connect / first-generation-signal / stream-idle / total-generation timeout
-- OpenAI Python SDK の automatic retry 無効化 (`max_retries=0`)
-- Discord message ID を request ID として backend header / log へ伝播
-- `/health` ではなく実 `/v1/chat/completions` を使う synthetic generation probe
-- watchdog state machine
-- restart 回数上限と cooldown
-- restart 後に probe が成功するまで対象 Local LLM の受付を再開しない
-- NVIDIA GPU visibility / VRAM residency / backend compute-process attribution
-- production manifest の fail-closed validation
-- production entrypoint の JSON event logging と本文 fail-closed redaction
+### 固定値
+
+| 項目 | 値 |
+| --- | --- |
+| backend | `llama.cpp` |
+| release | `v0.3.0` |
+| commit | `c1d0e7a004015f23bc0233470b747b596f29b264` |
+| model upstream | `ornith-ai/Ornith-1.5-9B` |
+| artifact repo | `ornith-ai/Ornith-1.5-9B-GGUF` |
+| revision | `2b651f3` |
+| artifact | `Ornith-1.5-9B-Q6_K.gguf` |
+| SHA256 | `b6f76e74f86245b3caee014b797c10dca931c4dfdaabfb134eab655f81e4154a` |
+| context | `32768` tokens |
+| endpoint | `http://127.0.0.1:8080/v1` |
+| supervisor | `systemd --user` |
+| backend service | `llmcord-llama-server.service` |
+| bot service | `llmcord.service` |
+| image input | disabled (`max_images: 0`) |
+
+モデル自体の最大 context と production context は別です。production は VRAM と長時間運用の上限を明示するため `32768` に固定し、長い会話は llmcord が token-aware auto compaction します。
+
+画像入力は `mmproj` の revision / SHA256 / VRAM 条件を production contract に固定するまで有効化しません。
+
+`min_vram_used_mib` は現時点で実GPU上の定常値を未計測のため `1` にしています。これは「GPU上に何らかの allocation がある」ための最低 guard であり、model residency の判定 authority は selected GPU 上の expected `llama-server` compute process です。実測 floor は #10 の実GPU evidence で更新します。
 
 ## セットアップ
 
-必要なもの:
-
-- uv
-- Discord Bot Token
-- Discord Developer Portal で有効化した `MESSAGE CONTENT INTENT`
-- OpenAI-compatible LLM endpoint
-
-開発・非production実行:
+### llmcord
 
 ```bash
-git clone https://github.com/KAFKA2306/llmcord.git
-cd llmcord
+git clone https://github.com/KAFKA2306/llmcord.git ~/llmcord
+cd ~/llmcord
 uv sync --locked
-export DISCORD_BOT_TOKEN='...'
-uv run python llmcord.py
+uv run --locked --no-sync python production_backend.py check --static
 ```
 
-production実行では `production_entrypoint.py` を使用します。
+依存関係の正本は `pyproject.toml` と `uv.lock` です。
+
+### llama.cpp
 
 ```bash
-uv run --locked --no-sync python production_entrypoint.py
+mkdir -p ~/.local/src ~/.local/opt
+git clone https://github.com/ggml-org/llama.cpp.git ~/.local/src/llama.cpp-v0.3.0
+cd ~/.local/src/llama.cpp-v0.3.0
+git checkout c1d0e7a004015f23bc0233470b747b596f29b264
+cmake -S . -B build \
+  -DGGML_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.local/opt/llama.cpp-v0.3.0"
+cmake --build build -j --target llama-server
+cmake --install build
 ```
 
-Docker image もこの entrypoint を使用します。
+`latest` / `main` / `master` は production に使いません。
+
+### model artifact
 
 ```bash
-docker compose up --build
+mkdir -p ~/.local/share/llmcord/models
+curl -fL \
+  -o ~/.local/share/llmcord/models/Ornith-1.5-9B-Q6_K.gguf \
+  https://huggingface.co/ornith-ai/Ornith-1.5-9B-GGUF/resolve/2b651f3/Ornith-1.5-9B-Q6_K.gguf
+
+printf '%s  %s\n' \
+  'b6f76e74f86245b3caee014b797c10dca931c4dfdaabfb134eab655f81e4154a' \
+  "$HOME/.local/share/llmcord/models/Ornith-1.5-9B-Q6_K.gguf" \
+  | sha256sum -c -
 ```
 
-依存関係の正本は `pyproject.toml`、固定解は `uv.lock` です。
+`production_backend.py check` と backend service 起動時にも同じ artifact hash を検証します。不一致なら backend を起動しません。
 
-## Production contract
+### Discord token
 
-production の backend / model / network / supervisor / GPU 条件は `config.yaml` の `production` を唯一の deployment authority とします。
-
-#7 の実機比較が終わるまでは `production.enabled: false` のままにし、backend や model を推測で固定しません。採用対象が決まった後に manifest を埋めて `true` にします。
-
-```yaml
-production:
-  enabled: true
-  backend: llamacpp
-  backend_version_or_commit: <pinned release or commit>
-  model: llamacpp/<model-alias>
-  model_artifact:
-    upstream: <exact upstream model>
-    artifact: <exact artifact filename>
-    revision: <pinned revision or commit>
-    sha256: <64-character sha256>
-    quantization_or_dtype: <exact quantization/dtype>
-    context_window_tokens: <actual production context>
-    # verify_path: /models/model.gguf
-  network:
-    mode: native
-    endpoint: http://127.0.0.1:8080/v1
-  supervisor:
-    kind: systemd
-    restart_command: ["systemctl", "restart", "llama-server.service"]
-  gpu:
-    required: true
-    device_index: 0
-    min_vram_used_mib: <measured production floor>
-    process_name_pattern: 'llama-server(?:\.exe)?$'
+```bash
+mkdir -p ~/.config/llmcord
+cat > ~/.config/llmcord/llmcord.env <<'EOF'
+DISCORD_BOT_TOKEN=replace-me
+EOF
+chmod 600 ~/.config/llmcord/llmcord.env
 ```
 
-`production_entrypoint.py` は Bot 起動前に `production_contract.py` で検証します。production有効時は以下を許可しません。
+必要な場合のみ `DISCORD_CLIENT_ID` を追加します。secret は repository や service unit に埋め込みません。
 
-- `latest` / `main` / `master` 等の floating runtime/model revision
-- model SHA-256 の欠落・形式不正
-- production model と `models` / watchdog対象の不一致
-- production endpoint と `providers.<backend>.base_url` の不一致
-- Docker mode で `localhost` / `127.0.0.1` を backend endpoint として使用
-- production supervisor と `health_control.restart_command` の不一致
-- GPU必須なのに watchdog GPU check が無効
-- GPU必須なのに期待backend process regexが未定義・不正
-- production model が起動時選択modelと一致しない構成
+### systemd user services
 
-`model_artifact.verify_path` を指定し、実行環境からmodel fileが見える場合は startup 時に SHA-256 も実測照合します。hash が違えば Discord Bot を起動しません。
+```bash
+systemctl --user is-system-running
+sudo loginctl enable-linger "$USER"
 
-既存 `providers` / `models` / `health_control` は実行用設定として残りますが、production有効時は manifest と一致していることを必須化します。値が食い違ったまま片方だけ更新して運用することはできません。
+mkdir -p ~/.config/systemd/user
+ln -sfn ~/llmcord/ops/systemd/llmcord-llama-server.service ~/.config/systemd/user/llmcord-llama-server.service
+ln -sfn ~/llmcord/ops/systemd/llmcord.service ~/.config/systemd/user/llmcord.service
+systemctl --user daemon-reload
+systemctl --user enable --now llmcord-llama-server.service llmcord.service
+```
+
+`systemctl --user` が利用できない環境はこの production contract と一致しません。別 supervisor へ silent fallback しません。
+
+backend process の supervisor authority は `llmcord-llama-server.service` です。watchdog は process を直接 spawn / kill せず、次だけを実行します。
+
+```text
+systemctl --user restart llmcord-llama-server.service
+```
+
+bot 自身は `llmcord.service` が別に監督します。
+
+## 検証
+
+manifest だけを検証:
+
+```bash
+cd ~/llmcord
+uv run --locked --no-sync python production_backend.py check --static
+```
+
+実 binary の release/commit と実 GGUF SHA256 まで検証:
+
+```bash
+uv run --locked --no-sync python production_backend.py check
+```
+
+この検証は以下を fail loudly にします。
+
+- backend release / commit / executable の不一致
+- model repo / revision / artifact URL / filename / SHA256 の不一致
+- model file 不在
+- endpoint の wildcard / non-loopback 化
+- production provider / model の複数化
+- runtime context window の drift
+- watchdog model / restart command / GPU 条件の drift
+- `mmproj` 未固定状態での画像入力有効化
 
 ## Runtime control
 
-```yaml
-runtime_control:
-  max_concurrency: 1
-  max_queue_size: 4
-  queue_wait_timeout_seconds: 300
-  connect_timeout_seconds: 10
-  first_token_timeout_seconds: 300
-  stream_idle_timeout_seconds: 120
-  total_generation_timeout_seconds: 1800
+```text
+max_concurrency = 1
+max_queue_size = 4
+queue_wait_timeout = 300 s
+connect_timeout = 10 s
+first_generation_signal_timeout = 300 s
+stream_idle_timeout = 120 s
+total_generation_timeout = 1800 s
 ```
 
-queue 上限を超えた request は backend へ送りません。stream が開始後に停止した場合も `stream_idle_timeout_seconds` で有限時間内に失敗へ移します。
+watchdog が `degraded` / `recovering` に入った場合、新規 request と queue 待ち request の両方を backend へ送りません。
 
-## 自動コンパクション
-
-利用者に「会話を短くする」「新しいスレッドを作る」ことを要求しません。対応 profile では backend と同じ token counting path で active context を測定し、hard limit の手前で古い履歴を自動圧縮します。
+## Context management
 
 ```text
-system/developer authority
-+ compacted older state
-+ recent verbatim messages
-+ current user input
-+ reserved output budget
+context_window = 32768
+max_output = 4096
+safety_margin = 1024
+hard input limit = 27648
+compaction trigger = 26000
+compaction target = 18000
+recent verbatim messages = 4
+compaction summary max output = 2048
 ```
 
-llama-server の例:
+system/developer authority、直近会話、現在入力は保持し、silent truncation は行いません。
 
-```yaml
-providers:
-  llamacpp:
-    base_url: http://localhost:8080/v1
+## Health / recovery
 
-models:
-  llamacpp/my-model:
-    context_management:
-      context_window_tokens: auto
-      max_output_tokens: 2048
-      safety_margin_tokens: 512
-      compaction_trigger_tokens: 12000
-      compaction_target_tokens: 8000
-      recent_messages: 3
-      compaction_max_output_tokens: 1024
-```
-
-数値は形式例です。production 値は実 model/runtime から決めます。`context_window_tokens: auto` は llama-server `/props` の `n_ctx`、入力 token 数は `/v1/chat/completions/input_tokens` を使います。取得に失敗した場合は文字数推定へ silent fallback しません。
-
-## Synthetic probe / watchdog
-
-正常性 authority は実生成です。
+正常性 authority は `/health` や `/v1/models` ではなく実 generation です。
 
 ```text
 POST /v1/chat/completions
-"Reply exactly: PONG"
+Reply exactly: PONG
 ```
 
-`backend_probe.py` が HTTP / timeout / protocol / unexpected output を分類します。process、port、`/health`、`/v1/models` が生存しているだけでは healthy としません。
+連続 failure が2回に達したら受付を閉じ、systemd backend service を restart します。restart 後は NVIDIA GPU の selected device / expected `llama-server` compute process と synthetic generation probe が成功して初めて受付を再開します。
 
-production の `health_control` は `production` manifest と一致させます。状態は `starting → healthy → suspect → degraded → recovering` と遷移し、連続失敗が threshold に達した時だけ対象 model の新規受付を停止します。restart は argv として直接実行し shell を使いません。restart 上限を超えて無限 restart しません。
-
-restart 後は GPU check と synthetic generation probe の両方が成功して初めて `healthy` に戻ります。
-
-### GPU / CPU fallback 判定
-
-GPU必須productionでは `nvidia-smi` を2段階で確認します。
-
-1. 選択deviceの `uuid / memory.used / utilization.gpu / temperature.gpu`
-2. 1で得たGPU UUIDを `--id=<GPU UUID>` に指定し、`--query-compute-apps=pid,process_name,used_gpu_memory` を実行
-
-総VRAMだけでは healthy としません。選択GPUに限定した compute process 一覧へ `production.gpu.process_name_pattern` と一致するbackend processが存在することを要求します。
-
-したがって、別アプリがGPUを使っていて総VRAMだけ高い一方、Local LLM backendがCPU fallbackしている状態は fail-closed になります。Windows/WDDMではprocess単位 `used_gpu_memory` が `N/A` になる場合があるため、その値自体は必須にせず、GPUのUUID filter・PID・process nameを主な帰属条件にします。
-
-実backendを選定したら `process_name_pattern` は広い `python` 等ではなく、そのruntimeをできるだけ一意に識別できるregexへ固定します。backendが汎用Python processしか見せない場合は、#10 の実機検証で追加のPID/supervisor帰属が必要です。
+厳密な実GPU検証は #10、実 Discord / process kill / generation hang / rollback / 24h soak は #14 で確認します。CI 成功だけを production 成功とは扱いません。
 
 ## Production observability
 
-production entrypoint は Bot 本体を起動する前に structured logging を設定し、stdout/stderr の運用ログを1行1JSON objectへ変換します。production backend/modelが確定している場合は各eventへ `provider` / `model` を付加します。
+`production_entrypoint.py` は Bot 本体より先に structured logging を設定し、運用ログを1行1JSON objectへ変換します。production event には固定した provider / model と request ID を付与でき、#14 の failure injection / soak evidence に使用します。
 
-現在分類する主要event:
+主要event:
 
 ```text
 production.startup
@@ -225,49 +236,47 @@ watchdog.recovered
 log
 ```
 
-`request_id` を含む既存request eventはDiscord message IDをそのまま引き継ぎます。
+Discord message本文、prompt、system prompt、attachment本文、response本文、API key、Authorization、Discord token、user ID は観測ログへ出しません。分類不能な runtime log も元の message 本文を捨てて fail-closed redaction します。
 
-観測ログには以下を出しません。
+## Rollback
 
-- Discord message本文
-- prompt / system prompt
-- attachment本文
-- response本文
-- API key / Authorization / Discord bot token
-- user ID（`request.received`では件数だけを保持）
+```bash
+cd ~/llmcord
+git checkout <verified-main-commit>
+uv sync --locked
+uv run --locked --no-sync python production_backend.py check
+systemctl --user daemon-reload
+systemctl --user restart llmcord-llama-server.service llmcord.service
+```
 
-既知のruntime logはevent/fieldへ変換します。分類できない新しいlogは安全側に倒し、**元のmessage本文を捨てて** `event=log`, `classified=false`, level/logger/request_idだけを保持します。観測不能より可用性を優先するため、observability変換失敗自体はBot requestを停止させません。
+backend/modelを変更したreleaseのrollbackでは、そのcommitの `config.yaml` に記録された llama.cpp commit と model SHA256 に実体を戻します。`production_backend.py check` が成功するまで production-ready と扱いません。
 
-このevent streamは #14 の障害注入・soak evidence の入力にします。現時点では全 #12 指標を実装済みとは扱いません。特に generation success/duration/output tokens、queue depth、GPU数値event、direct `llmcord.py` 開発実行のlegacy loggingは残課題です。
-
-## 検証
+## CI
 
 ```bash
 uv lock --check
 uv sync --locked
 uv run --locked --no-sync python -m py_compile \
   llmcord.py backend_probe.py context_management.py runtime_control.py health_control.py observability.py \
-  production_contract.py production_entrypoint.py
+  production_contract.py production_entrypoint.py production_backend.py
+uv run --locked --no-sync python production_backend.py check --static
 uv run --locked --no-sync python -m unittest discover -s tests -v
-docker build -t llmcord:test .
 ```
-
-CI / mock test の成功だけを production 成功とは扱いません。実 Discord・実 Local LLM・実 GPU での startup / restart / rollback / process kill / generation hang / GPU failure / CPU fallback / repeated compaction / 24h soak は #10 / #13 / #14 の実機受入で検証します。
 
 ## 主なファイル
 
 ```text
-llmcord.py                  Discord bridge
-context_management.py       token-aware auto compaction
-runtime_control.py           queue / concurrency / generation deadlines
-backend_probe.py             real-generation health probe
-health_control.py            watchdog / restart / GPU process health
-observability.py             production JSON events / privacy filter
-production_contract.py       canonical deployment validation
-production_entrypoint.py     production fail-closed startup path
-config.yaml                  runtime + canonical production manifest
-pyproject.toml               dependency authority
-uv.lock                      locked dependencies
+config.yaml                                  canonical production/runtime manifest
+production_contract.py                       contract validation
+production_backend.py                        backend check / startup
+production_entrypoint.py                      bot fail-closed startup
+ops/systemd/llmcord-llama-server.service     backend supervisor
+ops/systemd/llmcord.service                  bot supervisor
+health_control.py                             watchdog / GPU process health
+runtime_control.py                            bounded queue / deadlines
+context_management.py                        token-aware auto compaction
+backend_probe.py                              real-generation health probe
+observability.py                              privacy-safe production JSON events
 ```
 
 ## License
