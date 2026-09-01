@@ -70,6 +70,48 @@ class HealthControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(BackendState.DEGRADED, snapshot.state)
         self.assertFalse(snapshot.accepting)
 
+    async def test_immediate_health_failure_stops_accepting_without_threshold_delay(self):
+        async def probe():
+            return None
+
+        async def idle():
+            return True
+
+        watchdog = BackendWatchdog(self.policy(failure_threshold=3), probe=probe, idle=idle)
+        await watchdog.report_success()
+        await watchdog.report_failure("GPU disappeared", immediate=True)
+        snapshot = await watchdog.snapshot()
+        self.assertEqual(BackendState.DEGRADED, snapshot.state)
+        self.assertFalse(snapshot.accepting)
+        self.assertEqual(3, snapshot.consecutive_failures)
+
+    async def test_user_generation_success_requires_gpu_health(self):
+        gpu_healthy = True
+        gpu_checks = 0
+
+        async def probe():
+            return None
+
+        async def idle():
+            return True
+
+        async def gpu_check():
+            nonlocal gpu_checks
+            gpu_checks += 1
+            if not gpu_healthy:
+                raise HealthControlError("expected backend process missing from GPU")
+
+        watchdog = BackendWatchdog(self.policy(), probe=probe, idle=idle, gpu_check=gpu_check)
+        await watchdog.report_success()
+        self.assertEqual(BackendState.HEALTHY, (await watchdog.snapshot()).state)
+
+        gpu_healthy = False
+        await watchdog.report_success()
+        snapshot = await watchdog.snapshot()
+        self.assertEqual(BackendState.DEGRADED, snapshot.state)
+        self.assertFalse(snapshot.accepting)
+        self.assertEqual(2, gpu_checks)
+
     async def test_restart_requires_probe_before_reopening(self):
         calls = []
 
@@ -165,6 +207,41 @@ class HealthControlTests(unittest.IsolatedAsyncioTestCase):
         await watchdog.stop()
         await task
         self.assertEqual(0, probes)
+
+    async def test_healthy_state_periodically_checks_gpu_and_degrades_immediately(self):
+        gpu_checks = 0
+        probes = 0
+
+        async def probe():
+            nonlocal probes
+            probes += 1
+
+        async def idle():
+            return True
+
+        async def gpu_check():
+            nonlocal gpu_checks
+            gpu_checks += 1
+            if gpu_checks >= 2:
+                raise HealthControlError("CPU fallback detected")
+
+        watchdog = BackendWatchdog(
+            self.policy(probe_interval_seconds=0.005),
+            probe=probe,
+            idle=idle,
+            gpu_check=gpu_check,
+        )
+        # First check is the user-success authority; subsequent periodic check fails.
+        await watchdog.report_success()
+        task = asyncio.create_task(watchdog.run())
+        await asyncio.sleep(0.012)
+        snapshot = await watchdog.snapshot()
+        self.assertEqual(BackendState.DEGRADED, snapshot.state)
+        self.assertFalse(snapshot.accepting)
+        self.assertGreaterEqual(gpu_checks, 2)
+        self.assertEqual(0, probes)
+        await watchdog.stop()
+        await task
 
     def test_gpu_snapshot_parser(self):
         snapshot = parse_nvidia_gpu_snapshot("GPU-abc, 14321, 77, 68\n")
