@@ -21,6 +21,10 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_REVISION_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _RELEASE_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+_BUILD_INFO_RE = re.compile(
+    r"version:\s+(?P<version>[^\s]+)\s+\(build\s+\d+,\s+commit\s+(?P<commit>[0-9a-f]+)\)",
+    re.IGNORECASE,
+)
 _ALLOWED_NETWORK_MODES = {"native", "wsl", "docker"}
 _ALLOWED_SUPERVISORS = {"systemd", "docker-compose", "windows-service", "external"}
 
@@ -307,7 +311,12 @@ def verify_backend_executable(contract: ProductionContract) -> None:
     output = f"{completed.stdout}\n{completed.stderr}"
     if completed.returncode != 0:
         raise ProductionContractError("pinned backend --version returned non-zero")
-    if contract.backend_release.removeprefix("v") not in output:
+    match = _BUILD_INFO_RE.search(output)
+    if match is None:
+        raise ProductionContractError("pinned backend --version did not expose parseable build info")
+    expected_version = contract.backend_release.removeprefix("v")
+    if match.group("version") != expected_version:
         raise ProductionContractError("backend release does not match production.backend_release")
-    if contract.backend_version_or_commit[:9] not in output:
+    reported_commit = match.group("commit").lower()
+    if len(reported_commit) < 7 or not contract.backend_version_or_commit.startswith(reported_commit):
         raise ProductionContractError("backend commit does not match production.backend_version_or_commit")
