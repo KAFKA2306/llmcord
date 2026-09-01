@@ -15,7 +15,7 @@ llmcord
   ├─ token-aware auto compaction
   ├─ bounded queue / concurrency
   ├─ finite generation deadlines
-  └─ optional watchdog
+  └─ deterministic watchdog
          ↓
 OpenAI-compatible Local LLM
          ↓
@@ -36,12 +36,11 @@ NVIDIA GPU
 - OpenAI Python SDK の automatic retry 無効化 (`max_retries=0`)
 - Discord message ID を request ID として backend header / log へ伝播
 - `/health` ではなく実 `/v1/chat/completions` を使う synthetic generation probe
-- optional watchdog state machine
+- watchdog state machine
 - restart 回数上限と cooldown
 - restart 後に probe が成功するまで対象 Local LLM の受付を再開しない
 - optional NVIDIA GPU / VRAM residency check
-
-`health_control` は汎用リポジトリでは既定 `false` です。production backend / model / supervisor / GPU 条件を実環境から確定する前に推測値で有効化しません。
+- production manifest の fail-closed validation
 
 ## セットアップ
 
@@ -52,6 +51,8 @@ NVIDIA GPU
 - Discord Developer Portal で有効化した `MESSAGE CONTENT INTENT`
 - OpenAI-compatible LLM endpoint
 
+開発・非production実行:
+
 ```bash
 git clone https://github.com/KAFKA2306/llmcord.git
 cd llmcord
@@ -60,13 +61,66 @@ export DISCORD_BOT_TOKEN='...'
 uv run python llmcord.py
 ```
 
-Docker Compose:
+production実行では `production_entrypoint.py` を使用します。
+
+```bash
+uv run --locked --no-sync python production_entrypoint.py
+```
+
+Docker image もこの entrypoint を使用します。
 
 ```bash
 docker compose up --build
 ```
 
 依存関係の正本は `pyproject.toml`、固定解は `uv.lock` です。
+
+## Production contract
+
+production の backend / model / network / supervisor / GPU 条件は `config.yaml` の `production` を唯一の deployment authority とします。
+
+#7 の実機比較が終わるまでは `production.enabled: false` のままにし、backend や model を推測で固定しません。採用対象が決まった後に manifest を埋めて `true` にします。
+
+```yaml
+production:
+  enabled: true
+  backend: llamacpp
+  backend_version_or_commit: <pinned release or commit>
+  model: llamacpp/<model-alias>
+  model_artifact:
+    upstream: <exact upstream model>
+    artifact: <exact artifact filename>
+    revision: <pinned revision or commit>
+    sha256: <64-character sha256>
+    quantization_or_dtype: <exact quantization/dtype>
+    context_window_tokens: <actual production context>
+    # verify_path: /models/model.gguf
+  network:
+    mode: native
+    endpoint: http://127.0.0.1:8080/v1
+  supervisor:
+    kind: systemd
+    restart_command: ["systemctl", "restart", "llama-server.service"]
+  gpu:
+    required: true
+    device_index: 0
+    min_vram_used_mib: <measured production floor>
+```
+
+`production_entrypoint.py` は Bot 起動前に `production_contract.py` で検証します。production有効時は以下を許可しません。
+
+- `latest` / `main` / `master` 等の floating runtime/model revision
+- model SHA-256 の欠落・形式不正
+- production model と `models` / watchdog対象の不一致
+- production endpoint と `providers.<backend>.base_url` の不一致
+- Docker mode で `localhost` / `127.0.0.1` を backend endpoint として使用
+- production supervisor と `health_control.restart_command` の不一致
+- GPU必須なのに watchdog GPU check が無効
+- production model が起動時選択modelと一致しない構成
+
+`model_artifact.verify_path` を指定し、実行環境からmodel fileが見える場合は startup 時に SHA-256 も実測照合します。hash が違えば Discord Bot を起動しません。
+
+既存 `providers` / `models` / `health_control` は実行用設定として残りますが、production有効時は manifest と一致していることを必須化します。値が食い違ったまま片方だけ更新して運用することはできません。
 
 ## Runtime control
 
@@ -127,37 +181,9 @@ POST /v1/chat/completions
 
 `backend_probe.py` が HTTP / timeout / protocol / unexpected output を分類します。process、port、`/health`、`/v1/models` が生存しているだけでは healthy としません。
 
-production で watchdog を使う場合:
-
-```yaml
-health_control:
-  enabled: true
-  model: llamacpp/my-model
-  probe_interval_seconds: 60
-  probe_timeout_seconds: 30
-  probe_prompt: "Reply exactly: PONG"
-  probe_expected_text: PONG
-  probe_max_tokens: 8
-  failure_threshold: 2
-  restart_cooldown_seconds: 60
-  post_restart_grace_seconds: 10
-  max_restart_attempts: 3
-  restart_command_timeout_seconds: 30
-  restart_command: ["systemctl", "restart", "llama-server.service"]
-  nvidia_gpu:
-    enabled: true
-    device_index: 0
-    min_vram_used_mib: 12000
-    timeout_seconds: 5
-```
-
-上記の service 名・VRAM 値は例です。実環境で確認した値へ置き換えます。
-
-状態は `starting → healthy → suspect → degraded → recovering` と遷移します。連続失敗が `failure_threshold` に達した時だけ対象 model の新規受付を停止します。restart は argv として直接実行し shell を使いません。`max_restart_attempts` を超えて無限 restart しません。
+production の `health_control` は `production` manifest と一致させます。状態は `starting → healthy → suspect → degraded → recovering` と遷移し、連続失敗が threshold に達した時だけ対象 model の新規受付を停止します。restart は argv として直接実行し shell を使いません。restart 上限を超えて無限 restart しません。
 
 restart 後は、設定した GPU check と synthetic generation probe の両方が成功して初めて `healthy` に戻ります。
-
-Docker から host の systemd 等を直接操作できるとは仮定しません。`restart_command` は **llmcord が実際に動く環境から実行可能な supervisor interface** を明示してください。production supervisor の最終 authority は Issue #13 で固定します。
 
 ## 検証
 
@@ -165,24 +191,27 @@ Docker から host の systemd 等を直接操作できるとは仮定しませ�
 uv lock --check
 uv sync --locked
 uv run --locked --no-sync python -m py_compile \
-  llmcord.py backend_probe.py context_management.py runtime_control.py health_control.py
+  llmcord.py backend_probe.py context_management.py runtime_control.py health_control.py \
+  production_contract.py production_entrypoint.py
 uv run --locked --no-sync python -m unittest discover -s tests -v
 docker build -t llmcord:test .
 ```
 
-CI / mock test の成功だけを production 成功とは扱いません。実 Discord・実 Local LLM・実 GPU での process kill / generation hang / GPU failure / repeated compaction / 24h soak は Issue #14 の受入試験で検証します。
+CI / mock test の成功だけを production 成功とは扱いません。実 Discord・実 Local LLM・実 GPU での startup / restart / rollback / process kill / generation hang / GPU failure / repeated compaction / 24h soak は #13 / #14 の実機受入で検証します。
 
 ## 主なファイル
 
 ```text
-llmcord.py               Discord bridge
-context_management.py    token-aware auto compaction
-runtime_control.py        queue / concurrency / generation deadlines
-backend_probe.py          real-generation health probe
-health_control.py         watchdog / restart / optional GPU check
-config.yaml               runtime / provider / model policy
-pyproject.toml            dependency authority
-uv.lock                   locked dependencies
+llmcord.py                  Discord bridge
+context_management.py       token-aware auto compaction
+runtime_control.py           queue / concurrency / generation deadlines
+backend_probe.py             real-generation health probe
+health_control.py            watchdog / restart / optional GPU check
+production_contract.py       canonical deployment validation
+production_entrypoint.py     production fail-closed startup path
+config.yaml                  runtime + canonical production manifest
+pyproject.toml               dependency authority
+uv.lock                      locked dependencies
 ```
 
 ## License
