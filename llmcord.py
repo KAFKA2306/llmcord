@@ -15,6 +15,7 @@ import httpx
 from openai import AsyncOpenAI, OpenAIError
 import yaml
 
+from backend_probe import BackendProbeConfig, probe_generation
 from context_management import ContextManagementError, ContextPolicy, compaction_request_messages, prepare_context
 from health_control import BackendWatchdog, HealthControlError, WatchdogPolicy, check_nvidia_gpu, run_restart_command
 from runtime_control import (
@@ -216,20 +217,6 @@ def create_backend_watchdog() -> Optional[BackendWatchdog]:
     if missing:
         raise HealthControlError(f"missing health_control setting(s): {', '.join(missing)}")
 
-    probe_timeout = health_config["probe_timeout_seconds"]
-    probe_max_tokens = health_config["probe_max_tokens"]
-    if isinstance(probe_timeout, bool) or not isinstance(probe_timeout, (int, float)) or probe_timeout <= 0:
-        raise HealthControlError("probe_timeout_seconds must be a positive number")
-    if not isinstance(probe_max_tokens, int) or isinstance(probe_max_tokens, bool) or probe_max_tokens <= 0:
-        raise HealthControlError("probe_max_tokens must be a positive integer")
-
-    probe_prompt = health_config["probe_prompt"]
-    probe_expected_text = health_config["probe_expected_text"]
-    if not isinstance(probe_prompt, str) or not probe_prompt:
-        raise HealthControlError("probe_prompt must be a non-empty string")
-    if not isinstance(probe_expected_text, str) or not probe_expected_text:
-        raise HealthControlError("probe_expected_text must be a non-empty string")
-
     policy = WatchdogPolicy(
         probe_interval_seconds=health_config["probe_interval_seconds"],
         failure_threshold=health_config["failure_threshold"],
@@ -240,38 +227,29 @@ def create_backend_watchdog() -> Optional[BackendWatchdog]:
 
     base_url = provider_config["base_url"]
     api_key = provider_config.get("api_key", "sk-no-key-required")
-    probe_url = f"{base_url.rstrip('/')}/chat/completions"
-    extra_query = provider_config.get("extra_query")
-    headers = _request_headers(
-        api_key,
-        {**(provider_config.get("extra_headers") or {}), "X-LLMcord-Request-ID": "watchdog-probe"},
+    probe_config = BackendProbeConfig(
+        base_url=base_url,
+        model=model,
+        timeout_seconds=health_config["probe_timeout_seconds"],
+        expected_text=health_config["probe_expected_text"],
+        max_tokens=health_config["probe_max_tokens"],
+        prompt=health_config["probe_prompt"],
+        headers=_request_headers(
+            api_key,
+            {**(provider_config.get("extra_headers") or {}), "X-LLMcord-Request-ID": "watchdog-probe"},
+        ),
+        query=provider_config.get("extra_query") or {},
     )
 
     async def idle() -> bool:
         return (await inference_gate.snapshot())["in_system"] == 0
 
     async def probe() -> None:
-        response = await httpx_client.post(
-            probe_url,
-            headers=headers,
-            params=extra_query,
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": probe_prompt}],
-                "max_tokens": probe_max_tokens,
-                "temperature": 0,
-                "stream": False,
-            },
-            timeout=httpx.Timeout(probe_timeout, connect=min(probe_timeout, runtime_policy.connect_timeout_seconds)),
-        )
-        response.raise_for_status()
-        payload = response.json()
-        try:
-            content = payload["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise HealthControlError("synthetic generation probe returned no message content") from exc
-        if not isinstance(content, str) or probe_expected_text.casefold() not in content.casefold():
-            raise HealthControlError("synthetic generation probe did not return the expected text")
+        result = await probe_generation(probe_config)
+        if not result.healthy:
+            detail = result.detail or "no detail"
+            raise HealthControlError(f"synthetic generation probe failed ({result.error_class}): {detail}")
+        logging.info("watchdog synthetic probe healthy latency_seconds=%.3f", result.elapsed_seconds)
 
     restart_command = health_config["restart_command"]
     if not isinstance(restart_command, list) or any(not isinstance(part, str) or not part for part in restart_command):
@@ -684,6 +662,9 @@ async def on_message(new_msg: discord.Message) -> None:
 
                             last_task_time = datetime.now().timestamp()
 
+                if backend_watchdog is not None and provider_slash_model == health_target_model:
+                    await backend_watchdog.report_success()
+
                 if use_plain_responses:
                     for index, content in enumerate(response_contents):
                         if index == 0 and context_notice:
@@ -691,11 +672,20 @@ async def on_message(new_msg: discord.Message) -> None:
                         await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
 
         except GenerationTimeout as exc:
+            if backend_watchdog is not None and provider_slash_model == health_target_model:
+                await backend_watchdog.report_failure(exc)
             logging.exception("request_id=%s Generation timeout phase=%s", request_id, exc.phase)
             await new_msg.reply(f"⚠️ Local LLM timed out during {exc.phase}. The request stopped safely.", silent=True)
-        except GenerationProtocolError:
+        except GenerationProtocolError as exc:
+            if backend_watchdog is not None and provider_slash_model == health_target_model:
+                await backend_watchdog.report_failure(exc)
             logging.exception("request_id=%s Generation stream ended before a usable response", request_id)
             await new_msg.reply("⚠️ Local LLM ended the stream before producing a usable response.", silent=True)
+        except OpenAIError as exc:
+            if backend_watchdog is not None and provider_slash_model == health_target_model:
+                await backend_watchdog.report_failure(exc)
+            logging.exception("request_id=%s Backend API error while generating response", request_id)
+            await new_msg.reply("⚠️ Local LLM backend request failed. Health verification will run before recovery.", silent=True)
         except Exception:
             logging.exception("request_id=%s Error while generating response", request_id)
 
