@@ -16,6 +16,7 @@ from openai import AsyncOpenAI, OpenAIError
 import yaml
 
 from context_management import ContextManagementError, ContextPolicy, compaction_request_messages, prepare_context
+from health_control import BackendWatchdog, HealthControlError, WatchdogPolicy, check_nvidia_gpu, run_restart_command
 from runtime_control import (
     GenerationProtocolError,
     GenerationTimeout,
@@ -165,6 +166,7 @@ runtime_policy = RuntimePolicy(
     queue_wait_timeout_seconds=runtime_config["queue_wait_timeout_seconds"],
     connect_timeout_seconds=runtime_config["connect_timeout_seconds"],
     first_token_timeout_seconds=runtime_config["first_token_timeout_seconds"],
+    stream_idle_timeout_seconds=runtime_config["stream_idle_timeout_seconds"],
     total_generation_timeout_seconds=runtime_config["total_generation_timeout_seconds"],
 )
 inference_gate = InferenceGate(runtime_policy)
@@ -178,6 +180,131 @@ activity = discord.CustomActivity(name=(config.get("status_message") or "github.
 discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=None)
 
 httpx_client = httpx.AsyncClient()
+
+health_config = config.get("health_control") or {}
+if not isinstance(health_config, dict):
+    raise HealthControlError("health_control must be a mapping")
+health_target_model = health_config.get("model") if health_config.get("enabled", False) else None
+watchdog_task: Optional[asyncio.Task] = None
+
+
+def create_backend_watchdog() -> Optional[BackendWatchdog]:
+    if not health_config.get("enabled", False):
+        return None
+    if not isinstance(health_target_model, str) or health_target_model not in config["models"]:
+        raise HealthControlError("health_control.model must name a configured model")
+
+    provider_name, model = health_target_model.removesuffix(":vision").split("/", 1)
+    provider_config = config["providers"].get(provider_name)
+    if not isinstance(provider_config, dict):
+        raise HealthControlError("health_control.model references an unknown provider")
+
+    required = (
+        "probe_interval_seconds",
+        "probe_timeout_seconds",
+        "probe_prompt",
+        "probe_expected_text",
+        "probe_max_tokens",
+        "failure_threshold",
+        "restart_cooldown_seconds",
+        "post_restart_grace_seconds",
+        "max_restart_attempts",
+        "restart_command_timeout_seconds",
+        "restart_command",
+    )
+    missing = [name for name in required if name not in health_config]
+    if missing:
+        raise HealthControlError(f"missing health_control setting(s): {', '.join(missing)}")
+
+    probe_timeout = health_config["probe_timeout_seconds"]
+    probe_max_tokens = health_config["probe_max_tokens"]
+    if isinstance(probe_timeout, bool) or not isinstance(probe_timeout, (int, float)) or probe_timeout <= 0:
+        raise HealthControlError("probe_timeout_seconds must be a positive number")
+    if not isinstance(probe_max_tokens, int) or isinstance(probe_max_tokens, bool) or probe_max_tokens <= 0:
+        raise HealthControlError("probe_max_tokens must be a positive integer")
+
+    probe_prompt = health_config["probe_prompt"]
+    probe_expected_text = health_config["probe_expected_text"]
+    if not isinstance(probe_prompt, str) or not probe_prompt:
+        raise HealthControlError("probe_prompt must be a non-empty string")
+    if not isinstance(probe_expected_text, str) or not probe_expected_text:
+        raise HealthControlError("probe_expected_text must be a non-empty string")
+
+    policy = WatchdogPolicy(
+        probe_interval_seconds=health_config["probe_interval_seconds"],
+        failure_threshold=health_config["failure_threshold"],
+        restart_cooldown_seconds=health_config["restart_cooldown_seconds"],
+        post_restart_grace_seconds=health_config["post_restart_grace_seconds"],
+        max_restart_attempts=health_config["max_restart_attempts"],
+    )
+
+    base_url = provider_config["base_url"]
+    api_key = provider_config.get("api_key", "sk-no-key-required")
+    probe_url = f"{base_url.rstrip('/')}/chat/completions"
+    extra_query = provider_config.get("extra_query")
+    headers = _request_headers(
+        api_key,
+        {**(provider_config.get("extra_headers") or {}), "X-LLMcord-Request-ID": "watchdog-probe"},
+    )
+
+    async def idle() -> bool:
+        return (await inference_gate.snapshot())["in_system"] == 0
+
+    async def probe() -> None:
+        response = await httpx_client.post(
+            probe_url,
+            headers=headers,
+            params=extra_query,
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": probe_prompt}],
+                "max_tokens": probe_max_tokens,
+                "temperature": 0,
+                "stream": False,
+            },
+            timeout=httpx.Timeout(probe_timeout, connect=min(probe_timeout, runtime_policy.connect_timeout_seconds)),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        try:
+            content = payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise HealthControlError("synthetic generation probe returned no message content") from exc
+        if not isinstance(content, str) or probe_expected_text.casefold() not in content.casefold():
+            raise HealthControlError("synthetic generation probe did not return the expected text")
+
+    restart_command = health_config["restart_command"]
+    if not isinstance(restart_command, list) or any(not isinstance(part, str) or not part for part in restart_command):
+        raise HealthControlError("restart_command must be an argv list")
+
+    restart_action = None
+    if restart_command:
+        async def restart_action() -> None:
+            await run_restart_command(restart_command, health_config["restart_command_timeout_seconds"])
+
+    gpu_config = health_config.get("nvidia_gpu") or {}
+    if not isinstance(gpu_config, dict):
+        raise HealthControlError("health_control.nvidia_gpu must be a mapping")
+    gpu_check = None
+    if gpu_config.get("enabled", False):
+        async def gpu_check() -> None:
+            await check_nvidia_gpu(
+                device_index=gpu_config["device_index"],
+                min_vram_used_mib=gpu_config["min_vram_used_mib"],
+                timeout_seconds=gpu_config["timeout_seconds"],
+            )
+
+    return BackendWatchdog(
+        policy,
+        probe=probe,
+        idle=idle,
+        restart=restart_action,
+        gpu_check=gpu_check,
+        logger=logging.getLogger("llmcord.watchdog"),
+    )
+
+
+backend_watchdog = create_backend_watchdog()
 
 
 @dataclass
@@ -227,6 +354,11 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
 
 @discord_bot.event
 async def on_ready() -> None:
+    global watchdog_task
+
+    if backend_watchdog is not None and (watchdog_task is None or watchdog_task.done()):
+        watchdog_task = asyncio.create_task(backend_watchdog.run(), name="llmcord-backend-watchdog")
+
     if client_id := config.get("client_id"):
         logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317191168&scope=bot\n")
 
@@ -270,6 +402,15 @@ async def on_message(new_msg: discord.Message) -> None:
 
     provider_slash_model = curr_model
     provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
+
+    if backend_watchdog is not None and provider_slash_model == health_target_model and not await backend_watchdog.is_accepting():
+        snapshot = await backend_watchdog.snapshot()
+        logging.warning("backend unavailable state=%s failures=%s", snapshot.state, snapshot.consecutive_failures)
+        await new_msg.reply(
+            f"⚠️ Local LLM backend is {snapshot.state}. New requests are paused until a real generation probe succeeds.",
+            silent=True,
+        )
+        return
 
     request_id = str(new_msg.id)
     provider_config = config["providers"][provider]
@@ -499,6 +640,7 @@ async def on_message(new_msg: discord.Message) -> None:
                     create_generation_stream,
                     first_signal=is_generation_signal,
                     first_token_timeout_seconds=runtime_policy.first_token_timeout_seconds,
+                    stream_idle_timeout_seconds=runtime_policy.stream_idle_timeout_seconds,
                     total_generation_timeout_seconds=runtime_policy.total_generation_timeout_seconds,
                 ):
                     if finish_reason != None:
@@ -571,7 +713,14 @@ async def on_message(new_msg: discord.Message) -> None:
 
 
 async def main() -> None:
-    await discord_bot.start(config["bot_token"])
+    try:
+        await discord_bot.start(config["bot_token"])
+    finally:
+        if backend_watchdog is not None:
+            await backend_watchdog.stop()
+        if watchdog_task is not None:
+            await watchdog_task
+        await httpx_client.aclose()
 
 
 try:
