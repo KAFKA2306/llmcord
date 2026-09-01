@@ -52,6 +52,8 @@ production:
     required: true
     device_index: 0
     min_vram_used_mib: 1
+    # Regex matched against nvidia-smi compute-process names on the selected GPU UUID.
+    process_name_pattern: <backend-process-regex>
 
 # Runtime watchdog. In production this must match the production manifest above.
 # STARTING / DEGRADED / RECOVERING states reject new requests for the target model until a real generation probe succeeds.
