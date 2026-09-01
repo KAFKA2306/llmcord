@@ -19,6 +19,10 @@ class InferenceQueueTimeout(RuntimeControlError):
     """Raised when an admitted request waits too long for an inference slot."""
 
 
+class InferenceUnavailable(RuntimeControlError):
+    """Raised when the configured health authority closes inference admission."""
+
+
 class GenerationTimeout(RuntimeControlError):
     def __init__(self, phase: str) -> None:
         super().__init__(f"generation timed out during {phase}")
@@ -27,6 +31,9 @@ class GenerationTimeout(RuntimeControlError):
 
 class GenerationProtocolError(RuntimeControlError):
     """Raised when a streaming backend ends before producing a generation signal."""
+
+
+AdmissionCheck = Callable[[], Awaitable[bool]]
 
 
 @dataclass(frozen=True)
@@ -90,7 +97,10 @@ class InferenceGate:
         self._state_lock = asyncio.Lock()
         self._in_system = 0
 
-    async def acquire(self) -> InferenceLease:
+    async def acquire(self, admission_check: AdmissionCheck | None = None) -> InferenceLease:
+        if admission_check is not None and not await admission_check():
+            raise InferenceUnavailable("inference admission is closed by backend health control")
+
         async with self._state_lock:
             capacity = self.policy.max_concurrency + self.policy.max_queue_size
             if self._in_system >= capacity:
@@ -98,16 +108,26 @@ class InferenceGate:
             self._in_system += 1
 
         started = asyncio.get_running_loop().time()
+        acquired = False
         try:
             await asyncio.wait_for(
                 self._semaphore.acquire(),
                 timeout=self.policy.queue_wait_timeout_seconds,
             )
+            acquired = True
+
+            # A request can wait behind the in-flight generation that causes the
+            # watchdog to enter DEGRADED. Re-check at the point work would start,
+            # otherwise already-queued work can bypass the closed health gate.
+            if admission_check is not None and not await admission_check():
+                raise InferenceUnavailable("inference admission closed while this request was queued")
         except TimeoutError as exc:
             async with self._state_lock:
                 self._in_system -= 1
             raise InferenceQueueTimeout("timed out waiting for an inference slot") from exc
         except BaseException:
+            if acquired:
+                self._semaphore.release()
             async with self._state_lock:
                 self._in_system -= 1
             raise
