@@ -39,8 +39,6 @@ REQUIRED_SCENARIOS: tuple[str, ...] = (
     "bot_restart_conversation_continuity",
 )
 
-# These are the minimum runtime observations that make each case meaningful. A case
-# definition may require additional events, but it may not remove these baseline events.
 SCENARIO_BASELINE_EVENTS: dict[str, tuple[str, ...]] = {
     "backend_connection_refused": ("generation.failure",),
     "generation_hang": ("generation.timeout",),
@@ -207,6 +205,18 @@ def _string_list(value: Any, name: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _require_automated_assertions(case: Mapping[str, Any], reasons: list[str]) -> None:
+    if case.get("assertion_mode") != "automated":
+        reasons.append("assertion_mode must be 'automated'")
+    assertions = case.get("assertions")
+    if not isinstance(assertions, Mapping):
+        reasons.append("automated assertions mapping is missing")
+        return
+    for key in ("stimulus_applied", "expected_behavior_observed", "automatic_recovery_observed"):
+        if assertions.get(key) is not True:
+            reasons.append(f"automated assertion not satisfied: {key}")
+
+
 def evaluate_case(case: Mapping[str, Any], events: Sequence[Mapping[str, Any]]) -> CaseEvaluation:
     scenario = case.get("scenario")
     if not isinstance(scenario, str) or scenario not in REQUIRED_SCENARIOS:
@@ -230,6 +240,8 @@ def evaluate_case(case: Mapping[str, Any], events: Sequence[Mapping[str, Any]]) 
         if event_name in observed_events:
             reasons.append(f"forbidden event observed: {event_name}")
 
+    _require_automated_assertions(case, reasons)
+
     manual_interventions = case.get("manual_interventions")
     if not isinstance(manual_interventions, int) or isinstance(manual_interventions, bool) or manual_interventions < 0:
         reasons.append("manual_interventions is missing or invalid")
@@ -237,10 +249,20 @@ def evaluate_case(case: Mapping[str, Any], events: Sequence[Mapping[str, Any]]) 
         reasons.append(f"manual_interventions={manual_interventions}, expected 0")
 
     expected_request_ids = _string_list(case.get("request_ids"), f"{scenario}.request_ids")
-    if expected_request_ids:
+    if not expected_request_ids:
+        reasons.append("at least one real Discord request_id is required")
+    else:
         missing_ids = sorted(set(expected_request_ids) - set(request_ids))
         if missing_ids:
             reasons.append(f"request_id evidence missing: {', '.join(missing_ids)}")
+
+    if scenario in {"concurrent_discord_requests", "bot_restart_conversation_continuity"} and len(set(expected_request_ids)) < 2:
+        reasons.append("scenario requires at least two distinct Discord request_ids")
+
+    if scenario == "repeated_compaction":
+        compaction_count = sum(1 for event in window if event.get("event") == "context.compacted")
+        if compaction_count < 2:
+            reasons.append("repeated_compaction requires at least two context.compacted events")
 
     if not window:
         status = AcceptanceStatus.UNVERIFIED
@@ -270,8 +292,8 @@ def _non_negative_number(metrics: Mapping[str, Any], key: str, reasons: list[str
 def evaluate_soak(metrics: Mapping[str, Any], *, queue_capacity: int) -> SoakEvaluation:
     if not isinstance(metrics, Mapping):
         raise AcceptanceError("soak metrics must be a mapping")
-    if not isinstance(queue_capacity, int) or isinstance(queue_capacity, bool) or queue_capacity < 1:
-        raise AcceptanceError("queue_capacity must be a positive integer")
+    if not isinstance(queue_capacity, int) or isinstance(queue_capacity, bool) or queue_capacity < 0:
+        raise AcceptanceError("queue_capacity must be a non-negative integer")
 
     reasons: list[str] = []
     normalized: dict[str, int | float] = {}
@@ -292,7 +314,7 @@ def evaluate_soak(metrics: Mapping[str, Any], *, queue_capacity: int) -> SoakEva
         ),
         (normalized["manual_interventions"] == 0, "manual_interventions must be 0"),
         (normalized["hangs"] == 0, "unrecovered hangs must be 0"),
-        (normalized["queue_peak"] <= queue_capacity, f"queue_peak must not exceed bounded capacity {queue_capacity}"),
+        (normalized["queue_peak"] <= queue_capacity, f"queue_peak must not exceed bounded waiting queue {queue_capacity}"),
         (normalized["queue_overflow_incidents"] == 0, "queue_overflow_incidents must be 0"),
         (normalized["compaction_failures"] == 0, "compaction_failures must be 0"),
         (normalized["summary_regressions"] == 0, "summary_regressions must be 0"),
@@ -354,9 +376,10 @@ def evaluate_acceptance(
         raise AcceptanceError("runtime_control must be configured")
     max_concurrency = runtime_control.get("max_concurrency")
     max_queue_size = runtime_control.get("max_queue_size")
-    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (max_concurrency, max_queue_size)):
-        raise AcceptanceError("runtime_control concurrency/queue limits must be non-negative integers")
-    queue_capacity = max_concurrency + max_queue_size
+    if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int) or max_concurrency < 1:
+        raise AcceptanceError("runtime_control.max_concurrency must be a positive integer")
+    if isinstance(max_queue_size, bool) or not isinstance(max_queue_size, int) or max_queue_size < 0:
+        raise AcceptanceError("runtime_control.max_queue_size must be a non-negative integer")
 
     case_results: list[CaseEvaluation] = []
     seen: set[str] = set()
@@ -382,7 +405,7 @@ def evaluate_acceptance(
             )
 
     case_results.sort(key=lambda result: REQUIRED_SCENARIOS.index(result.scenario))
-    soak = evaluate_soak(soak_metrics, queue_capacity=queue_capacity)
+    soak = evaluate_soak(soak_metrics, queue_capacity=max_queue_size)
 
     statuses = [result.status for result in case_results] + [soak.status]
     if AcceptanceStatus.FAIL in statuses:
@@ -405,7 +428,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Evaluate llmcord production acceptance evidence")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--events", required=True, help="production JSONL event stream")
-    parser.add_argument("--cases", required=True, help="JSON array of failure-injection case evidence")
+    parser.add_argument("--cases", required=True, help="JSON array of automated failure-injection case evidence")
     parser.add_argument("--soak", required=True, help="JSON object containing measured 24h soak metrics")
     parser.add_argument("--output", required=True, help="path for the canonical machine-readable acceptance result")
     args = parser.parse_args(argv)
