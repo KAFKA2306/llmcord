@@ -32,6 +32,7 @@ class ObservabilityTests(unittest.TestCase):
                 "bot_token": "discord-secret",
                 "prompt": "private prompt",
                 "content": "private content",
+                "message": "private log body",
                 "message_content": "private message",
                 "attachment_body": "private file",
                 "input_tokens": 123,
@@ -44,6 +45,7 @@ class ObservabilityTests(unittest.TestCase):
             "bot_token",
             "prompt",
             "content",
+            "message",
             "message_content",
             "attachment_body",
         ):
@@ -66,6 +68,20 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(7, payload["conversation_messages"])
         self.assertNotIn(secret, encoded)
         self.assertNotIn("999", encoded)
+
+    def test_unclassified_log_body_is_dropped(self):
+        secret = "provider returned private request body"
+        payload = classify_message(
+            f"request_id=123 unexpected diagnostic {secret}",
+            level="ERROR",
+            logger_name="root",
+        )
+        encoded = json.dumps(payload)
+        self.assertEqual("log", payload["event"])
+        self.assertFalse(payload["classified"])
+        self.assertEqual("123", payload["request_id"])
+        self.assertNotIn(secret, encoded)
+        self.assertNotIn("message", payload)
 
     def test_runtime_log_classification(self):
         admitted = classify_message(
