@@ -93,7 +93,7 @@ class AcceptanceTests(unittest.TestCase):
             "manual_interventions": 0,
             "peak_ram_mib": 32000,
             "peak_vram_mib": 15000,
-            "queue_peak": 5,
+            "queue_peak": 4,
             "queue_overflow_incidents": 0,
             "compaction_count": 12,
             "compaction_failures": 0,
@@ -106,32 +106,66 @@ class AcceptanceTests(unittest.TestCase):
             "secret_or_token_leaks": 0,
         }
 
-    def case(self, scenario, required_events=()):
+    def case(self, scenario, *, request_ids=("req-1",), required_events=()):
         return {
             "scenario": scenario,
             "started_at": "2026-09-01T00:00:00+00:00",
             "ended_at": "2026-09-01T00:00:59+00:00",
             "required_events": list(required_events),
             "manual_interventions": 0,
+            "request_ids": list(request_ids),
+            "assertion_mode": "automated",
+            "assertions": {
+                "stimulus_applied": True,
+                "expected_behavior_observed": True,
+                "automatic_recovery_observed": True,
+            },
         }
 
-    def test_case_does_not_trust_declared_success_without_events(self):
-        result = evaluate_case(self.case("backend_process_kill"), [self.event("request.received", 1)])
+    def test_case_does_not_trust_assertions_without_required_events(self):
+        result = evaluate_case(
+            self.case("backend_process_kill"),
+            [self.event("request.rejected", 1, "req-1")],
+        )
         self.assertEqual(AcceptanceStatus.FAIL, result.status)
         self.assertIn("required event missing: watchdog.restart", result.reasons)
         self.assertIn("required event missing: probe.success", result.reasons)
 
-    def test_case_passes_only_when_required_events_exist_in_window(self):
+    def test_case_passes_only_when_required_events_and_discord_request_exist(self):
         events = [
-            self.event("watchdog.failure", 1),
-            self.event("watchdog.restart", 2),
-            self.event("probe.success", 3),
+            self.event("generation.failure", 1, "req-1"),
+            self.event("watchdog.failure", 2),
+            self.event("watchdog.restart", 3),
+            self.event("probe.success", 4),
         ]
         result = evaluate_case(self.case("backend_process_kill"), events)
         self.assertEqual(AcceptanceStatus.PASS, result.status)
 
+    def test_manual_assertion_mode_is_not_accepted(self):
+        case = self.case("queue_full")
+        case["assertion_mode"] = "manual"
+        result = evaluate_case(case, [self.event("queue.rejected", 1, "req-1")])
+        self.assertEqual(AcceptanceStatus.FAIL, result.status)
+        self.assertIn("assertion_mode must be 'automated'", result.reasons)
+
+    def test_concurrent_scenario_requires_two_distinct_discord_requests(self):
+        result = evaluate_case(
+            self.case("concurrent_discord_requests", request_ids=("req-1",)),
+            [self.event("queue.admitted", 1, "req-1")],
+        )
+        self.assertEqual(AcceptanceStatus.FAIL, result.status)
+        self.assertIn("scenario requires at least two distinct Discord request_ids", result.reasons)
+
+    def test_repeated_compaction_requires_multiple_compactions(self):
+        result = evaluate_case(
+            self.case("repeated_compaction"),
+            [self.event("request.received", 1, "req-1"), self.event("context.compacted", 2)],
+        )
+        self.assertEqual(AcceptanceStatus.FAIL, result.status)
+        self.assertIn("repeated_compaction requires at least two context.compacted events", result.reasons)
+
     def test_missing_required_scenarios_make_acceptance_unverified(self):
-        events = [self.event("queue.rejected", 1)]
+        events = [self.event("queue.rejected", 1, "req-1")]
         result = evaluate_acceptance(
             config=self.config(),
             events=events,
@@ -146,29 +180,29 @@ class AcceptanceTests(unittest.TestCase):
         metrics = self.passing_soak()
         metrics["duration_hours"] = 23.9
         metrics["manual_interventions"] = 1
-        result = evaluate_soak(metrics, queue_capacity=5)
+        result = evaluate_soak(metrics, queue_capacity=4)
         self.assertEqual(AcceptanceStatus.FAIL, result.status)
         self.assertIn("duration_hours must be at least 24", result.reasons)
         self.assertIn("manual_interventions must be 0", result.reasons)
 
-    def test_soak_queue_peak_cannot_exceed_bounded_capacity(self):
+    def test_soak_queue_peak_cannot_exceed_waiting_queue_limit(self):
         metrics = self.passing_soak()
-        metrics["queue_peak"] = 6
-        result = evaluate_soak(metrics, queue_capacity=5)
+        metrics["queue_peak"] = 5
+        result = evaluate_soak(metrics, queue_capacity=4)
         self.assertEqual(AcceptanceStatus.FAIL, result.status)
-        self.assertIn("queue_peak must not exceed bounded capacity 5", result.reasons)
+        self.assertIn("queue_peak must not exceed bounded waiting queue 4", result.reasons)
 
     def test_missing_soak_metric_is_unverified_not_pass(self):
         metrics = self.passing_soak()
         del metrics["secret_or_token_leaks"]
-        result = evaluate_soak(metrics, queue_capacity=5)
+        result = evaluate_soak(metrics, queue_capacity=4)
         self.assertEqual(AcceptanceStatus.UNVERIFIED, result.status)
 
     def test_disabled_production_contract_cannot_be_accepted(self):
         config = self.config()
         config["production"]["enabled"] = False
         with self.assertRaisesRegex(AcceptanceError, "production contract must be enabled"):
-            evaluate_acceptance(config=config, events=[self.event("request.received")], cases=[], soak_metrics={})
+            evaluate_acceptance(config=config, events=[self.event("request.received", request_id="req-1")], cases=[], soak_metrics={})
 
     def test_event_evidence_rejects_sensitive_keys(self):
         with tempfile.TemporaryDirectory() as directory:
