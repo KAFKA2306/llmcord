@@ -19,6 +19,25 @@ runtime_control:
   first_token_timeout_seconds: 300
   total_generation_timeout_seconds: 1800
 
+# Optional production watchdog. Keep disabled until one Local LLM backend/model and
+# one supervisor command have been selected for the deployment. When enabled, the
+# configured model is pinned for the process and admission stays closed until a real
+# generation probe succeeds. restart_command is argv, never a shell command string.
+backend_watchdog:
+  enabled: false
+  model: llamacpp/<model-alias>
+  probe_interval_seconds: 30
+  probe_timeout_seconds: 15
+  failure_threshold: 2
+  restart_cooldown_seconds: 10
+  restart_settle_seconds: 5
+  max_restart_attempts: 3
+  restart_timeout_seconds: 30
+  restart_command:
+    - systemctl
+    - restart
+    - llama-server.service
+
 use_plain_responses: false
 allow_dms: true
 
