@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -35,22 +34,23 @@ class ProductionRuntimeTests(unittest.TestCase):
         )
         self.assertEqual("wsl2-native", production["deployment"]["platform"])
         self.assertEqual("systemd-user", production["deployment"]["supervisor"])
+        self.assertEqual(0, self.config["max_images"])
 
     def test_backend_command_is_loopback_single_slot_and_pinned_context(self) -> None:
         argv = backend_argv(self.config)
-        self.assertIn("--host", argv)
         self.assertEqual("127.0.0.1", argv[argv.index("--host") + 1])
         self.assertEqual("8080", argv[argv.index("--port") + 1])
         self.assertEqual("32768", argv[argv.index("--ctx-size") + 1])
         self.assertEqual("1", argv[argv.index("--parallel") + 1])
         self.assertEqual("all", argv[argv.index("--n-gpu-layers") + 1])
-        self.assertIn("Ornith-1.5-9B-Q6_K.gguf", argv[argv.index("--model") + 1])
+        self.assertTrue(argv[argv.index("--model") + 1].endswith("Ornith-1.5-9B-Q6_K.gguf"))
 
     def test_public_or_unpinned_network_and_artifacts_fail_loudly(self) -> None:
         for mutator in (
             lambda c: c["production"]["deployment"].__setitem__("api_host", "0.0.0.0"),
             lambda c: c["production"]["backend"].__setitem__("version", "latest"),
             lambda c: c["production"]["model"].__setitem__("revision", "main"),
+            lambda c: c.__setitem__("max_images", 1),
         ):
             candidate = copy.deepcopy(self.config)
             mutator(candidate)
@@ -75,7 +75,7 @@ class ProductionRuntimeTests(unittest.TestCase):
 
     def test_model_hash_verification_uses_exact_sha256(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            artifact = Path(directory) / "model.gguf"
+            artifact = Path(directory) / "Ornith-1.5-9B-Q6_K.gguf"
             artifact.write_bytes(b"canonical model bytes")
             digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
 
@@ -88,7 +88,7 @@ class ProductionRuntimeTests(unittest.TestCase):
             with self.assertRaises(ProductionContractError):
                 verify_model_artifact(candidate)
 
-    def test_backend_binary_path_is_home_relative_not_repo_or_container_specific(self) -> None:
+    def test_backend_binary_and_model_paths_are_not_container_specific(self) -> None:
         production = validate_config(self.config)
         binary = production["backend"]["binary"]
         model_path = production["model"]["path"]
