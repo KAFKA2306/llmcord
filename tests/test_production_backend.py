@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
+import tempfile
 import unittest
 
 from production_backend import backend_argv
-from production_contract import ProductionContract
+from production_contract import ProductionContract, ProductionContractError, verify_backend_executable
 
 
 class ProductionBackendTests(unittest.TestCase):
@@ -42,6 +45,28 @@ class ProductionBackendTests(unittest.TestCase):
         self.assertEqual("1", argv[argv.index("--parallel") + 1])
         self.assertEqual("all", argv[argv.index("--n-gpu-layers") + 1])
         self.assertEqual("ornith-1.5-9b-q6_k", argv[argv.index("--alias") + 1])
+
+    def fake_backend(self, directory: str, output: str) -> Path:
+        path = Path(directory) / "llama-server"
+        path.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}' >&2\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def test_upstream_short_commit_is_accepted_when_it_matches_full_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.fake_backend(directory, "version: 0.3.0 (build 9999, commit c1d0e7a)")
+            verify_backend_executable(replace(self.contract(), backend_executable=str(path)))
+
+    def test_dev_version_or_wrong_commit_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dev = self.fake_backend(directory, "version: 0.3.0-dev (build 9999, commit c1d0e7a)")
+            with self.assertRaisesRegex(ProductionContractError, "release"):
+                verify_backend_executable(replace(self.contract(), backend_executable=str(dev)))
+
+        with tempfile.TemporaryDirectory() as directory:
+            wrong = self.fake_backend(directory, "version: 0.3.0 (build 9999, commit deadbee)")
+            with self.assertRaisesRegex(ProductionContractError, "commit"):
+                verify_backend_executable(replace(self.contract(), backend_executable=str(wrong)))
 
 
 if __name__ == "__main__":
