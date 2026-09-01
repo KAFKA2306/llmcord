@@ -15,31 +15,32 @@ class ProductionEntrypointTests(unittest.TestCase):
     def contract(self, *, gpu_required=True, pattern=r"llama-server(?:\.exe)?$"):
         return ProductionContract(
             backend="llamacpp",
-            backend_version_or_commit="b123",
+            backend_release="v0.3.0",
+            backend_version_or_commit="c1d0e7a004015f23bc0233470b747b596f29b264",
+            backend_executable="/opt/llama/bin/llama-server",
             model="llamacpp/local-model",
             model_upstream="example/model",
-            model_artifact="model.gguf",
-            model_revision="abc123",
+            artifact_repo="example/model-GGUF",
+            model_artifact="model-Q6_K.gguf",
+            model_revision="0123456",
+            artifact_url="https://huggingface.co/example/model-GGUF/resolve/0123456/model-Q6_K.gguf",
             model_sha256="a" * 64,
-            quantization_or_dtype="Q4_K_M",
+            quantization_or_dtype="Q6_K",
             context_window_tokens=32768,
-            network_mode="native",
+            network_mode="wsl",
             network_endpoint="http://127.0.0.1:8080/v1",
             supervisor_kind="systemd",
-            restart_command=("systemctl", "restart", "llama-server.service"),
+            restart_command=("systemctl", "--user", "restart", "llmcord-llama-server.service"),
             gpu_required=gpu_required,
             gpu_device_index=0 if gpu_required else None,
-            min_vram_used_mib=12000 if gpu_required else None,
+            min_vram_used_mib=1 if gpu_required else None,
             gpu_process_name_pattern=pattern if gpu_required else None,
-            artifact_path=None,
+            artifact_path="/models/model-Q6_K.gguf",
         )
 
     def test_production_gpu_process_pattern_is_projected(self):
         configure_runtime_environment(self.contract())
-        self.assertEqual(
-            r"llama-server(?:\.exe)?$",
-            os.environ[GPU_PROCESS_PATTERN_ENV],
-        )
+        self.assertEqual(r"llama-server(?:\.exe)?$", os.environ[GPU_PROCESS_PATTERN_ENV])
 
     def test_disabled_production_removes_stale_pattern(self):
         os.environ[GPU_PROCESS_PATTERN_ENV] = "stale"
