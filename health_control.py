@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 from dataclasses import dataclass
 from enum import StrEnum
+import io
 import logging
+import os
+import re
 from typing import Awaitable, Callable, Optional, Sequence
 
 
@@ -11,6 +15,8 @@ Probe = Callable[[], Awaitable[None]]
 RestartAction = Callable[[], Awaitable[None]]
 GpuCheck = Callable[[], Awaitable[None]]
 IdleCheck = Callable[[], Awaitable[bool]]
+
+GPU_PROCESS_PATTERN_ENV = "LLMCORD_GPU_PROCESS_PATTERN"
 
 
 class HealthControlError(RuntimeError):
@@ -60,6 +66,125 @@ class WatchdogSnapshot:
     last_error: Optional[str]
 
 
+@dataclass(frozen=True)
+class NvidiaGpuSnapshot:
+    uuid: str
+    vram_used_mib: int
+    utilization_percent: float
+    temperature_c: float
+
+
+@dataclass(frozen=True)
+class NvidiaComputeProcess:
+    gpu_uuid: str
+    pid: int
+    process_name: str
+    used_gpu_memory_mib: int | None
+
+
+def parse_nvidia_gpu_snapshot(output: str) -> NvidiaGpuSnapshot:
+    rows = list(csv.reader(io.StringIO(output.strip())))
+    if len(rows) != 1 or len(rows[0]) != 4:
+        raise HealthControlError("NVIDIA GPU check returned an unexpected device payload")
+    fields = [field.strip() for field in rows[0]]
+    if not fields[0]:
+        raise HealthControlError("NVIDIA GPU UUID is empty")
+    try:
+        return NvidiaGpuSnapshot(
+            uuid=fields[0],
+            vram_used_mib=int(float(fields[1])),
+            utilization_percent=float(fields[2]),
+            temperature_c=float(fields[3]),
+        )
+    except ValueError as exc:
+        raise HealthControlError("NVIDIA GPU metrics were not numeric") from exc
+
+
+def _parse_optional_gpu_memory(value: str) -> int | None:
+    normalized = value.strip().lower()
+    if normalized in {"n/a", "[n/a]", "not supported", ""}:
+        return None
+    try:
+        return int(float(value.strip()))
+    except ValueError as exc:
+        raise HealthControlError(f"NVIDIA compute-process GPU memory was invalid: {value!r}") from exc
+
+
+def parse_nvidia_compute_processes(output: str) -> list[NvidiaComputeProcess]:
+    if not output.strip():
+        return []
+
+    processes: list[NvidiaComputeProcess] = []
+    for row in csv.reader(io.StringIO(output.strip())):
+        if len(row) != 4:
+            raise HealthControlError("NVIDIA compute-process query returned an unexpected payload")
+        gpu_uuid, pid_text, process_name, memory_text = (field.strip() for field in row)
+        if not gpu_uuid or not process_name:
+            raise HealthControlError("NVIDIA compute-process query returned an empty GPU UUID or process name")
+        try:
+            pid = int(pid_text)
+        except ValueError as exc:
+            raise HealthControlError("NVIDIA compute-process PID was not numeric") from exc
+        if pid <= 0:
+            raise HealthControlError("NVIDIA compute-process PID must be positive")
+        processes.append(
+            NvidiaComputeProcess(
+                gpu_uuid=gpu_uuid,
+                pid=pid,
+                process_name=process_name,
+                used_gpu_memory_mib=_parse_optional_gpu_memory(memory_text),
+            )
+        )
+    return processes
+
+
+def require_expected_gpu_process(
+    processes: Sequence[NvidiaComputeProcess],
+    *,
+    gpu_uuid: str,
+    process_name_pattern: str,
+) -> NvidiaComputeProcess:
+    try:
+        pattern = re.compile(process_name_pattern, re.IGNORECASE)
+    except re.error as exc:
+        raise HealthControlError(f"invalid GPU process_name_pattern: {exc}") from exc
+
+    for process in processes:
+        if process.gpu_uuid == gpu_uuid and pattern.search(process.process_name):
+            return process
+
+    raise HealthControlError(
+        "expected backend compute process is not present on the selected GPU; "
+        "possible CPU fallback, wrong GPU, or backend process loss"
+    )
+
+
+async def _run_nvidia_smi(
+    executable: str,
+    *arguments: str,
+    timeout_seconds: float,
+    failure_label: str,
+) -> str:
+    process = await asyncio.create_subprocess_exec(
+        executable,
+        *arguments,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except TimeoutError as exc:
+        process.kill()
+        await process.communicate()
+        raise HealthControlError(f"{failure_label} timed out") from exc
+
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip() or stdout.decode("utf-8", errors="replace").strip()
+        raise HealthControlError(f"{failure_label} failed: {detail[:500]}")
+
+    return stdout.decode("utf-8", errors="replace")
+
+
 async def run_restart_command(command: Sequence[str], timeout_seconds: float) -> None:
     """Execute one explicit argv restart action without a shell."""
 
@@ -92,10 +217,12 @@ async def check_nvidia_gpu(
     timeout_seconds: float,
     executable: str = "nvidia-smi",
 ) -> None:
-    """Require a visible NVIDIA GPU and an expected minimum resident VRAM footprint.
+    """Require the expected NVIDIA GPU state for the production backend.
 
-    This is a coarse fail-closed check. Exact backend-process/GPU attribution remains a
-    separate production acceptance requirement because unrelated GPU allocations can exist.
+    The base check requires a visible GPU and a calibrated total VRAM floor. When the
+    production entrypoint provides LLMCORD_GPU_PROCESS_PATTERN, the selected GPU UUID must
+    also contain a matching active compute process. This catches a backend that is alive and
+    answering on CPU while unrelated allocations make total GPU VRAM look healthy.
     """
 
     if not isinstance(device_index, int) or isinstance(device_index, bool) or device_index < 0:
@@ -105,42 +232,39 @@ async def check_nvidia_gpu(
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
         raise HealthControlError("GPU check timeout must be a positive number")
 
-    process = await asyncio.create_subprocess_exec(
+    gpu_output = await _run_nvidia_smi(
         executable,
         f"--id={device_index}",
         "--query-gpu=uuid,memory.used,utilization.gpu,temperature.gpu",
         "--format=csv,noheader,nounits",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        timeout_seconds=timeout_seconds,
+        failure_label="NVIDIA GPU query",
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
-    except TimeoutError as exc:
-        process.kill()
-        await process.communicate()
-        raise HealthControlError("nvidia-smi timed out") from exc
+    snapshot = parse_nvidia_gpu_snapshot(gpu_output)
 
-    if process.returncode != 0:
-        detail = stderr.decode("utf-8", errors="replace").strip()
-        raise HealthControlError(f"NVIDIA GPU check failed: {detail[:500]}")
-
-    line = stdout.decode("utf-8", errors="replace").strip().splitlines()
-    if len(line) != 1:
-        raise HealthControlError("NVIDIA GPU check returned an unexpected device count")
-    fields = [field.strip() for field in line[0].split(",")]
-    if len(fields) != 4 or not fields[0]:
-        raise HealthControlError("NVIDIA GPU check returned an unexpected payload")
-    try:
-        vram_used_mib = int(float(fields[1]))
-        float(fields[2])
-        float(fields[3])
-    except ValueError as exc:
-        raise HealthControlError("NVIDIA GPU metrics were not numeric") from exc
-
-    if vram_used_mib < min_vram_used_mib:
+    if snapshot.vram_used_mib < min_vram_used_mib:
         raise HealthControlError(
-            f"GPU VRAM residency is below the production floor: {vram_used_mib} MiB < {min_vram_used_mib} MiB"
+            f"GPU VRAM residency is below the production floor: "
+            f"{snapshot.vram_used_mib} MiB < {min_vram_used_mib} MiB"
         )
+
+    process_name_pattern = os.environ.get(GPU_PROCESS_PATTERN_ENV)
+    if not process_name_pattern:
+        return
+
+    process_output = await _run_nvidia_smi(
+        executable,
+        "--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory",
+        "--format=csv,noheader,nounits",
+        timeout_seconds=timeout_seconds,
+        failure_label="NVIDIA compute-process query",
+    )
+    processes = parse_nvidia_compute_processes(process_output)
+    require_expected_gpu_process(
+        processes,
+        gpu_uuid=snapshot.uuid,
+        process_name_pattern=process_name_pattern,
+    )
 
 
 class BackendWatchdog:
@@ -207,7 +331,6 @@ class BackendWatchdog:
                 self._state = BackendState.DEGRADED
                 self._wake.set()
             elif previous_state == BackendState.STARTING:
-                # Never admit user work before at least one real generation probe has succeeded.
                 self._state = BackendState.STARTING
             elif previous_state != BackendState.RECOVERING:
                 self._state = BackendState.SUSPECT
@@ -304,8 +427,6 @@ class BackendWatchdog:
                                 await self.report_success()
                     continue
 
-                # HEALTHY/SUSPECT: user-generation outcomes are the health signal. Do not
-                # race a background synthetic request against the max_concurrency=1 path.
                 await self._wait(self.policy.probe_interval_seconds)
         finally:
             async with self._state_lock:
