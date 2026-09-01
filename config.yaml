@@ -20,9 +20,42 @@ runtime_control:
   stream_idle_timeout_seconds: 120
   total_generation_timeout_seconds: 1800
 
-# Optional production watchdog for one Local LLM model. When enabled, STARTING / DEGRADED /
-# RECOVERING states reject new requests for the target model until a real generation probe succeeds.
-# restart_command is argv, never a shell string. Leave it empty to detect/degrade without self-restart.
+# Canonical deployment authority. Keep disabled until #7 has selected the actual backend/model.
+# Once enabled, production_entrypoint.py validates this manifest before starting Discord.
+# Existing providers/models/health_control values are execution projections and must match it exactly.
+production:
+  enabled: false
+  backend: <selected-provider>
+  backend_version_or_commit: <pinned-release-or-commit>
+  model: <provider>/<model-alias>
+  model_artifact:
+    upstream: <upstream-model>
+    artifact: <exact-artifact-name>
+    revision: <pinned-revision-or-commit>
+    sha256: <64-character-sha256>
+    quantization_or_dtype: <exact-quantization-or-dtype>
+    context_window_tokens: 1
+    # Optional. If the bot host/container can see the model file, startup verifies SHA-256.
+    # verify_path: /models/model.gguf
+  network:
+    # native | wsl | docker
+    mode: native
+    endpoint: http://127.0.0.1:8080/v1
+  supervisor:
+    # systemd | docker-compose | windows-service | external
+    kind: systemd
+    restart_command:
+      - systemctl
+      - restart
+      - llama-server.service
+  gpu:
+    required: true
+    device_index: 0
+    min_vram_used_mib: 1
+
+# Runtime watchdog. In production this must match the production manifest above.
+# STARTING / DEGRADED / RECOVERING states reject new requests for the target model until a real generation probe succeeds.
+# restart_command is argv, never a shell string.
 health_control:
   enabled: false
   model: llamacpp/<model-alias>
