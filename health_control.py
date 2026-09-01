@@ -76,7 +76,6 @@ class NvidiaGpuSnapshot:
 
 @dataclass(frozen=True)
 class NvidiaComputeProcess:
-    gpu_uuid: str
     pid: int
     process_name: str
     used_gpu_memory_mib: int | None
@@ -116,11 +115,11 @@ def parse_nvidia_compute_processes(output: str) -> list[NvidiaComputeProcess]:
 
     processes: list[NvidiaComputeProcess] = []
     for row in csv.reader(io.StringIO(output.strip())):
-        if len(row) != 4:
+        if len(row) != 3:
             raise HealthControlError("NVIDIA compute-process query returned an unexpected payload")
-        gpu_uuid, pid_text, process_name, memory_text = (field.strip() for field in row)
-        if not gpu_uuid or not process_name:
-            raise HealthControlError("NVIDIA compute-process query returned an empty GPU UUID or process name")
+        pid_text, process_name, memory_text = (field.strip() for field in row)
+        if not process_name:
+            raise HealthControlError("NVIDIA compute-process query returned an empty process name")
         try:
             pid = int(pid_text)
         except ValueError as exc:
@@ -129,7 +128,6 @@ def parse_nvidia_compute_processes(output: str) -> list[NvidiaComputeProcess]:
             raise HealthControlError("NVIDIA compute-process PID must be positive")
         processes.append(
             NvidiaComputeProcess(
-                gpu_uuid=gpu_uuid,
                 pid=pid,
                 process_name=process_name,
                 used_gpu_memory_mib=_parse_optional_gpu_memory(memory_text),
@@ -141,7 +139,6 @@ def parse_nvidia_compute_processes(output: str) -> list[NvidiaComputeProcess]:
 def require_expected_gpu_process(
     processes: Sequence[NvidiaComputeProcess],
     *,
-    gpu_uuid: str,
     process_name_pattern: str,
 ) -> NvidiaComputeProcess:
     try:
@@ -150,7 +147,7 @@ def require_expected_gpu_process(
         raise HealthControlError(f"invalid GPU process_name_pattern: {exc}") from exc
 
     for process in processes:
-        if process.gpu_uuid == gpu_uuid and pattern.search(process.process_name):
+        if pattern.search(process.process_name):
             return process
 
     raise HealthControlError(
@@ -220,9 +217,9 @@ async def check_nvidia_gpu(
     """Require the expected NVIDIA GPU state for the production backend.
 
     The base check requires a visible GPU and a calibrated total VRAM floor. When the
-    production entrypoint provides LLMCORD_GPU_PROCESS_PATTERN, the selected GPU UUID must
-    also contain a matching active compute process. This catches a backend that is alive and
-    answering on CPU while unrelated allocations make total GPU VRAM look healthy.
+    production entrypoint provides LLMCORD_GPU_PROCESS_PATTERN, the selected GPU must also
+    contain a matching active compute process. The compute-app query is filtered by the
+    immutable GPU UUID obtained from the first query rather than depending on GPU index order.
     """
 
     if not isinstance(device_index, int) or isinstance(device_index, bool) or device_index < 0:
@@ -254,7 +251,8 @@ async def check_nvidia_gpu(
 
     process_output = await _run_nvidia_smi(
         executable,
-        "--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory",
+        f"--id={snapshot.uuid}",
+        "--query-compute-apps=pid,process_name,used_gpu_memory",
         "--format=csv,noheader,nounits",
         timeout_seconds=timeout_seconds,
         failure_label="NVIDIA compute-process query",
@@ -262,7 +260,6 @@ async def check_nvidia_gpu(
     processes = parse_nvidia_compute_processes(process_output)
     require_expected_gpu_process(
         processes,
-        gpu_uuid=snapshot.uuid,
         process_name_pattern=process_name_pattern,
     )
 
