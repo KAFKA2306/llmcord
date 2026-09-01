@@ -20,7 +20,10 @@ def configure_runtime_environment(contract: ProductionContract | None) -> None:
 def main() -> None:
     config_path = Path("config.yaml")
     config = load_resolved_config(str(config_path))
-    contract = validate_production_contract(config)
+    # The backend systemd unit owns expensive binary/model artifact verification.
+    # The bot validates the canonical manifest and its runtime projections without
+    # hashing the multi-GB GGUF again on every bot restart.
+    contract = validate_production_contract(config, verify_artifact=False)
     configure_runtime_environment(contract)
 
     install_structured_logging(
@@ -35,13 +38,16 @@ def main() -> None:
         emit_event(
             "production.startup",
             contract_enabled=True,
+            backend_release=contract.backend_release,
+            backend_commit=contract.backend_version_or_commit,
             network_mode=contract.network_mode,
             supervisor=contract.supervisor_kind,
             gpu_required=contract.gpu_required,
         )
         logging.info(
-            "production contract validated backend=%s model=%s network_mode=%s supervisor=%s gpu_required=%s",
+            "production contract validated backend=%s release=%s model=%s network_mode=%s supervisor=%s gpu_required=%s",
             contract.backend,
+            contract.backend_release,
             contract.model,
             contract.network_mode,
             contract.supervisor_kind,
