@@ -39,7 +39,7 @@ NVIDIA GPU
 - watchdog state machine
 - restart 回数上限と cooldown
 - restart 後に probe が成功するまで対象 Local LLM の受付を再開しない
-- optional NVIDIA GPU / VRAM residency check
+- NVIDIA GPU visibility / VRAM residency / backend compute-process attribution
 - production manifest の fail-closed validation
 
 ## セットアップ
@@ -105,6 +105,7 @@ production:
     required: true
     device_index: 0
     min_vram_used_mib: <measured production floor>
+    process_name_pattern: 'llama-server(?:\.exe)?$'
 ```
 
 `production_entrypoint.py` は Bot 起動前に `production_contract.py` で検証します。production有効時は以下を許可しません。
@@ -116,6 +117,7 @@ production:
 - Docker mode で `localhost` / `127.0.0.1` を backend endpoint として使用
 - production supervisor と `health_control.restart_command` の不一致
 - GPU必須なのに watchdog GPU check が無効
+- GPU必須なのに期待backend process regexが未定義・不正
 - production model が起動時選択modelと一致しない構成
 
 `model_artifact.verify_path` を指定し、実行環境からmodel fileが見える場合は startup 時に SHA-256 も実測照合します。hash が違えば Discord Bot を起動しません。
@@ -183,7 +185,20 @@ POST /v1/chat/completions
 
 production の `health_control` は `production` manifest と一致させます。状態は `starting → healthy → suspect → degraded → recovering` と遷移し、連続失敗が threshold に達した時だけ対象 model の新規受付を停止します。restart は argv として直接実行し shell を使いません。restart 上限を超えて無限 restart しません。
 
-restart 後は、設定した GPU check と synthetic generation probe の両方が成功して初めて `healthy` に戻ります。
+restart 後は GPU check と synthetic generation probe の両方が成功して初めて `healthy` に戻ります。
+
+### GPU / CPU fallback 判定
+
+GPU必須productionでは `nvidia-smi` を2段階で確認します。
+
+1. 選択deviceの `uuid / memory.used / utilization.gpu / temperature.gpu`
+2. `--query-compute-apps` の `gpu_uuid / pid / process_name / used_gpu_memory`
+
+総VRAMだけでは healthy としません。選択GPU UUIDの compute process 一覧に `production.gpu.process_name_pattern` と一致するbackend processが存在することを要求します。
+
+したがって、別アプリがGPUを使っていて総VRAMだけ高い一方、Local LLM backendがCPU fallbackしている状態は fail-closed になります。Windows/WDDMではprocess単位 `used_gpu_memory` が `N/A` になる場合があるため、その値自体は必須にせず、GPU UUID・PID・process nameを主な帰属条件にします。
+
+実backendを選定したら `process_name_pattern` は広い `python` 等ではなく、そのruntimeをできるだけ一意に識別できるregexへ固定します。backendが汎用Python processしか見せない場合は、#10 の実機検証で追加のPID/supervisor帰属が必要です。
 
 ## 検証
 
@@ -197,7 +212,7 @@ uv run --locked --no-sync python -m unittest discover -s tests -v
 docker build -t llmcord:test .
 ```
 
-CI / mock test の成功だけを production 成功とは扱いません。実 Discord・実 Local LLM・実 GPU での startup / restart / rollback / process kill / generation hang / GPU failure / repeated compaction / 24h soak は #13 / #14 の実機受入で検証します。
+CI / mock test の成功だけを production 成功とは扱いません。実 Discord・実 Local LLM・実 GPU での startup / restart / rollback / process kill / generation hang / GPU failure / CPU fallback / repeated compaction / 24h soak は #10 / #13 / #14 の実機受入で検証します。
 
 ## 主なファイル
 
@@ -206,7 +221,7 @@ llmcord.py                  Discord bridge
 context_management.py       token-aware auto compaction
 runtime_control.py           queue / concurrency / generation deadlines
 backend_probe.py             real-generation health probe
-health_control.py            watchdog / restart / optional GPU check
+health_control.py            watchdog / restart / GPU process health
 production_contract.py       canonical deployment validation
 production_entrypoint.py     production fail-closed startup path
 config.yaml                  runtime + canonical production manifest

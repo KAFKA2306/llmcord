@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 import runpy
 
-from production_contract import load_resolved_config, validate_production_contract
+from health_control import GPU_PROCESS_PATTERN_ENV
+from production_contract import ProductionContract, load_resolved_config, validate_production_contract
+
+
+def configure_runtime_environment(contract: ProductionContract | None) -> None:
+    if contract is not None and contract.gpu_required and contract.gpu_process_name_pattern:
+        os.environ[GPU_PROCESS_PATTERN_ENV] = contract.gpu_process_name_pattern
+    else:
+        os.environ.pop(GPU_PROCESS_PATTERN_ENV, None)
 
 
 def main() -> None:
     config_path = Path("config.yaml")
     config = load_resolved_config(str(config_path))
     contract = validate_production_contract(config)
+    configure_runtime_environment(contract)
 
     if contract is None:
         logging.info("production contract disabled; starting llmcord without production validation")

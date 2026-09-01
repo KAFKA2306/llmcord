@@ -36,6 +36,7 @@ class ProductionContractTests(unittest.TestCase):
                     "required": True,
                     "device_index": 0,
                     "min_vram_used_mib": 12000,
+                    "process_name_pattern": r"llama-server(?:\.exe)?$",
                 },
             },
             "providers": {
@@ -67,6 +68,7 @@ class ProductionContractTests(unittest.TestCase):
         self.assertEqual("llamacpp", contract.backend)
         self.assertEqual("llamacpp/local-model", contract.model)
         self.assertTrue(contract.gpu_required)
+        self.assertEqual(r"llama-server(?:\.exe)?$", contract.gpu_process_name_pattern)
 
     def test_disabled_contract_is_noop(self):
         config = self.config()
@@ -100,6 +102,18 @@ class ProductionContractTests(unittest.TestCase):
             "llamacpp/local-model": config["models"]["llamacpp/local-model"],
         }
         with self.assertRaisesRegex(ProductionContractError, "must be the first configured model"):
+            validate_production_contract(config)
+
+    def test_gpu_required_requires_process_identity(self):
+        config = self.config()
+        del config["production"]["gpu"]["process_name_pattern"]
+        with self.assertRaisesRegex(ProductionContractError, "process_name_pattern"):
+            validate_production_contract(config)
+
+    def test_invalid_gpu_process_pattern_is_rejected(self):
+        config = self.config()
+        config["production"]["gpu"]["process_name_pattern"] = "["
+        with self.assertRaisesRegex(ProductionContractError, "process_name_pattern is invalid"):
             validate_production_contract(config)
 
     def test_accessible_artifact_hash_is_verified(self):

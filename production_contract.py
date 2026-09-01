@@ -120,6 +120,7 @@ class ProductionContract:
     gpu_required: bool
     gpu_device_index: int | None
     min_vram_used_mib: int | None
+    gpu_process_name_pattern: str | None
     artifact_path: str | None
 
 
@@ -175,13 +176,19 @@ def validate_production_contract(config: Mapping[str, Any]) -> ProductionContrac
         raise ProductionContractError("production.gpu.required must be boolean")
     gpu_device_index = None
     min_vram_used_mib = None
+    gpu_process_name_pattern = None
     if gpu_required:
         gpu_device_index = gpu.get("device_index")
         min_vram_used_mib = gpu.get("min_vram_used_mib")
+        gpu_process_name_pattern = _required_text(gpu, "process_name_pattern", "production.gpu")
         if not isinstance(gpu_device_index, int) or isinstance(gpu_device_index, bool) or gpu_device_index < 0:
             raise ProductionContractError("production.gpu.device_index must be a non-negative integer")
         if not isinstance(min_vram_used_mib, int) or isinstance(min_vram_used_mib, bool) or min_vram_used_mib <= 0:
             raise ProductionContractError("production.gpu.min_vram_used_mib must be a positive integer")
+        try:
+            re.compile(gpu_process_name_pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise ProductionContractError(f"production.gpu.process_name_pattern is invalid: {exc}") from exc
 
     providers = _mapping(config.get("providers"), "providers")
     provider = _mapping(providers.get(backend), f"providers.{backend}")
@@ -246,6 +253,7 @@ def validate_production_contract(config: Mapping[str, Any]) -> ProductionContrac
         gpu_required=gpu_required,
         gpu_device_index=gpu_device_index,
         min_vram_used_mib=min_vram_used_mib,
+        gpu_process_name_pattern=gpu_process_name_pattern,
         artifact_path=artifact_path,
     )
 
