@@ -84,7 +84,7 @@ class BackendWatchdog:
         self.restart_attempts_since_healthy = 0
         self.total_restart_attempts = 0
         self.last_probe: BackendProbeResult | None = None
-        self._accepting = False
+        self._accepting: bool | None = None
 
     async def initialize(self) -> None:
         await self._set_accepting(False)
@@ -188,7 +188,7 @@ class BackendWatchdog:
     def snapshot(self) -> WatchdogSnapshot:
         return WatchdogSnapshot(
             state=self.state,
-            accepting=self._accepting,
+            accepting=bool(self._accepting),
             consecutive_failures=self.consecutive_failures,
             restart_attempts_since_healthy=self.restart_attempts_since_healthy,
             total_restart_attempts=self.total_restart_attempts,
