@@ -15,6 +15,7 @@ _SENSITIVE_KEYS = {
     "authorization",
     "bot_token",
     "content",
+    "message",
     "message_content",
     "prompt",
     "request_body",
@@ -44,11 +45,6 @@ _WATCHDOG_FAILURE_RE = re.compile(
 _WATCHDOG_RESTART_RE = re.compile(r"backend recovery restart attempt=(?P<attempt>\d+)")
 _WATCHDOG_RECOVERED_RE = re.compile(r"backend recovery succeeded attempt=(?P<attempt>\d+)")
 _PROBE_RE = re.compile(r"watchdog synthetic probe healthy latency_seconds=(?P<latency>[0-9.]+)")
-_SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)\b(authorization|api_key|bot_token|discord_bot_token)\s*[=:]\s*([^\s,;]+)"
-)
-_BEARER_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
-_SK_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 
 
 def _sanitize_scalar(value: Any) -> Any:
@@ -72,13 +68,6 @@ def sanitize_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
         else:
             sanitized[key_text] = _sanitize_scalar(value)
     return sanitized
-
-
-def redact_message(message: str) -> str:
-    message = _SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}={_REDACTED}", message)
-    message = _BEARER_RE.sub(f"Bearer {_REDACTED}", message)
-    message = _SK_RE.sub(_REDACTED, message)
-    return message
 
 
 def build_event(
@@ -176,12 +165,15 @@ def classify_message(message: str, *, level: str, logger_name: str) -> dict[str,
     if match := _PROBE_RE.fullmatch(message):
         return build_event("probe.success", latency_seconds=float(match.group("latency")))
 
+    # Fail closed for observability privacy: retain routing metadata, never an arbitrary
+    # unclassified log body. This prevents a new log statement from silently leaking prompts,
+    # attachments, provider error bodies, or credentials.
     return build_event(
         "log",
         request_id=_request_id_from(message),
         level=level,
         logger=logger_name,
-        message=redact_message(message),
+        classified=False,
     )
 
 
