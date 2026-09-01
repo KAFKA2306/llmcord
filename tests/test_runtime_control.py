@@ -42,6 +42,7 @@ class RuntimeControlTests(unittest.IsolatedAsyncioTestCase):
             queue_wait_timeout_seconds=0.2,
             connect_timeout_seconds=0.1,
             first_token_timeout_seconds=0.1,
+            stream_idle_timeout_seconds=0.1,
             total_generation_timeout_seconds=0.3,
         )
         values.update(overrides)
@@ -88,6 +89,7 @@ class RuntimeControlTests(unittest.IsolatedAsyncioTestCase):
                 factory,
                 first_signal=lambda item: item == "token",
                 first_token_timeout_seconds=0.08,
+                stream_idle_timeout_seconds=0.1,
                 total_generation_timeout_seconds=0.3,
             ):
                 pass
@@ -95,7 +97,7 @@ class RuntimeControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("first_token", raised.exception.phase)
         self.assertTrue(stream.closed)
 
-    async def test_total_generation_timeout_closes_stream(self):
+    async def test_stream_idle_timeout_closes_stalled_stream(self):
         stream = FakeStream([(0, "token"), (0.2, "later")])
 
         async def factory():
@@ -107,11 +109,33 @@ class RuntimeControlTests(unittest.IsolatedAsyncioTestCase):
                 factory,
                 first_signal=lambda item: item == "token",
                 first_token_timeout_seconds=0.05,
-                total_generation_timeout_seconds=0.08,
+                stream_idle_timeout_seconds=0.05,
+                total_generation_timeout_seconds=0.3,
             ):
                 received.append(item)
 
         self.assertEqual(["token"], received)
+        self.assertEqual("stream_idle", raised.exception.phase)
+        self.assertTrue(stream.closed)
+
+    async def test_total_generation_timeout_closes_stream(self):
+        stream = FakeStream([(0, "token"), (0.04, "later"), (0.04, "later2"), (0.04, "later3")])
+
+        async def factory():
+            return stream
+
+        received = []
+        with self.assertRaises(GenerationTimeout) as raised:
+            async for item in stream_with_timeouts(
+                factory,
+                first_signal=lambda item: item == "token",
+                first_token_timeout_seconds=0.05,
+                stream_idle_timeout_seconds=0.06,
+                total_generation_timeout_seconds=0.09,
+            ):
+                received.append(item)
+
+        self.assertGreaterEqual(len(received), 2)
         self.assertEqual("total", raised.exception.phase)
         self.assertTrue(stream.closed)
 
@@ -126,6 +150,7 @@ class RuntimeControlTests(unittest.IsolatedAsyncioTestCase):
                 factory,
                 first_signal=lambda item: item == "token",
                 first_token_timeout_seconds=0.05,
+                stream_idle_timeout_seconds=0.05,
                 total_generation_timeout_seconds=0.1,
             ):
                 pass
@@ -136,6 +161,8 @@ class RuntimeControlTests(unittest.IsolatedAsyncioTestCase):
             self.policy(max_concurrency=0)
         with self.assertRaises(RuntimeControlError):
             self.policy(first_token_timeout_seconds=1, total_generation_timeout_seconds=0.5)
+        with self.assertRaises(RuntimeControlError):
+            self.policy(stream_idle_timeout_seconds=1, total_generation_timeout_seconds=0.5)
 
 
 if __name__ == "__main__":

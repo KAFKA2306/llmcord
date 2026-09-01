@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import time
 from typing import Any
 
@@ -14,6 +14,9 @@ class BackendProbeConfig:
     timeout_seconds: float = 15.0
     expected_text: str = "PONG"
     max_tokens: int = 8
+    prompt: str = "Reply exactly: PONG"
+    headers: dict[str, str] = field(default_factory=dict)
+    query: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.base_url.strip():
@@ -24,6 +27,10 @@ class BackendProbeConfig:
             raise ValueError("timeout_seconds must be positive")
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
+        if not self.prompt.strip():
+            raise ValueError("prompt must not be empty")
+        if not self.expected_text.strip():
+            raise ValueError("expected_text must not be empty")
 
 
 @dataclass(frozen=True)
@@ -61,6 +68,11 @@ def _extract_text(payload: Any) -> str:
     return content.strip()
 
 
+def _chat_completions_url(base_url: str) -> str:
+    root = base_url.rstrip("/")
+    return f"{root}/chat/completions" if root.endswith("/v1") else f"{root}/v1/chat/completions"
+
+
 async def probe_generation(
     config: BackendProbeConfig,
     *,
@@ -76,19 +88,18 @@ async def probe_generation(
     timeout = httpx.Timeout(config.timeout_seconds)
 
     try:
-        async with httpx.AsyncClient(
-            base_url=config.base_url.rstrip("/"),
-            timeout=timeout,
-            transport=transport,
-        ) as client:
+        async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
             response = await client.post(
-                "/v1/chat/completions",
+                _chat_completions_url(config.base_url),
+                headers=config.headers,
+                params=config.query,
                 json={
                     "model": config.model,
                     "messages": [
-                        {"role": "user", "content": "Reply exactly: PONG"}
+                        {"role": "user", "content": config.prompt}
                     ],
                     "max_tokens": config.max_tokens,
+                    "temperature": 0,
                     "stream": False,
                 },
             )

@@ -29,6 +29,28 @@ class BackendProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.response_text, "PONG")
         self.assertIsNone(result.error_class)
 
+    async def test_v1_base_url_headers_query_and_prompt_are_preserved(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, "/v1/chat/completions")
+            self.assertEqual(request.url.params["api-version"], "test")
+            self.assertEqual(request.headers["X-Test"], "yes")
+            payload = json.loads(request.content)
+            self.assertEqual(payload["messages"][0]["content"], "Say READY")
+            return httpx.Response(200, json={"choices": [{"message": {"content": "READY"}}]})
+
+        result = await probe_generation(
+            BackendProbeConfig(
+                base_url="http://backend/v1",
+                model="local-model",
+                prompt="Say READY",
+                expected_text="READY",
+                headers={"X-Test": "yes"},
+                query={"api-version": "test"},
+            ),
+            transport=httpx.MockTransport(handler),
+        )
+        self.assertTrue(result.healthy)
+
     async def test_generation_probe_rejects_shallow_but_invalid_response(self) -> None:
         async def handler(_: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"object": "list", "data": []})
@@ -94,6 +116,13 @@ class BackendProbeTests(unittest.IsolatedAsyncioTestCase):
                 base_url="http://backend",
                 model="local-model",
                 max_tokens=0,
+            )
+
+        with self.assertRaises(ValueError):
+            BackendProbeConfig(
+                base_url="http://backend",
+                model="local-model",
+                prompt="",
             )
 
 

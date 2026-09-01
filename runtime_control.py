@@ -36,6 +36,7 @@ class RuntimePolicy:
     queue_wait_timeout_seconds: float
     connect_timeout_seconds: float
     first_token_timeout_seconds: float
+    stream_idle_timeout_seconds: float
     total_generation_timeout_seconds: float
 
     def __post_init__(self) -> None:
@@ -48,6 +49,7 @@ class RuntimePolicy:
             "queue_wait_timeout_seconds": self.queue_wait_timeout_seconds,
             "connect_timeout_seconds": self.connect_timeout_seconds,
             "first_token_timeout_seconds": self.first_token_timeout_seconds,
+            "stream_idle_timeout_seconds": self.stream_idle_timeout_seconds,
             "total_generation_timeout_seconds": self.total_generation_timeout_seconds,
         }
         for name, value in positive_seconds.items():
@@ -56,6 +58,8 @@ class RuntimePolicy:
 
         if self.first_token_timeout_seconds > self.total_generation_timeout_seconds:
             raise RuntimeControlError("first_token_timeout_seconds must not exceed total_generation_timeout_seconds")
+        if self.stream_idle_timeout_seconds > self.total_generation_timeout_seconds:
+            raise RuntimeControlError("stream_idle_timeout_seconds must not exceed total_generation_timeout_seconds")
 
 
 @dataclass
@@ -147,11 +151,14 @@ async def stream_with_timeouts(
     *,
     first_signal: Callable[[Any], bool],
     first_token_timeout_seconds: float,
+    stream_idle_timeout_seconds: float,
     total_generation_timeout_seconds: float,
 ) -> AsyncIterator[Any]:
-    """Yield a stream with separate first-generation-signal and total deadlines.
+    """Yield a stream with first-signal, between-signal, and total deadlines.
 
     Empty protocol chunks before the first real generation signal are intentionally discarded.
+    After generation begins, a backend that stops emitting protocol chunks is failed by the
+    stream-idle deadline instead of occupying the only GPU slot until the total deadline.
     The stream is closed on completion, timeout, cancellation, or error.
     """
 
@@ -175,7 +182,14 @@ async def stream_with_timeouts(
                     raise GenerationTimeout("first_token") from exc
 
                 yield item
-                async for item in iterator:
+                while True:
+                    try:
+                        async with asyncio.timeout(stream_idle_timeout_seconds):
+                            item = await anext(iterator)
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError as exc:
+                        raise GenerationTimeout("stream_idle") from exc
                     yield item
         except TimeoutError as exc:
             phase = "total" if first_seen else "first_token"

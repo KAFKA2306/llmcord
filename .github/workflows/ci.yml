@@ -31,7 +31,7 @@ jobs:
         run: uv sync --locked
 
       - name: Compile
-        run: uv run --locked --no-sync python -m py_compile llmcord.py context_management.py runtime_control.py backend_probe.py
+        run: uv run --locked --no-sync python -m py_compile llmcord.py backend_probe.py context_management.py runtime_control.py health_control.py
 
       - name: Unit tests
         run: uv run --locked --no-sync python -m unittest discover -s tests -v
