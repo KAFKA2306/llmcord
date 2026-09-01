@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from health_control import BackendState, BackendWatchdog, HealthControlError, WatchdogPolicy
@@ -28,6 +29,19 @@ class HealthControlTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await watchdog.snapshot()
         self.assertEqual(BackendState.HEALTHY, snapshot.state)
         self.assertTrue(snapshot.accepting)
+
+    async def test_startup_probe_failure_never_opens_admission(self):
+        async def probe():
+            return None
+
+        async def idle():
+            return True
+
+        watchdog = BackendWatchdog(self.policy(failure_threshold=3), probe=probe, idle=idle)
+        await watchdog.report_failure("startup probe failed")
+        snapshot = await watchdog.snapshot()
+        self.assertEqual(BackendState.STARTING, snapshot.state)
+        self.assertFalse(snapshot.accepting)
 
     async def test_failure_threshold_stops_accepting(self):
         async def probe():
@@ -125,6 +139,24 @@ class HealthControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, snapshot.consecutive_failures)
         self.assertEqual(0, snapshot.restart_attempts)
         self.assertEqual(BackendState.HEALTHY, snapshot.state)
+
+    async def test_healthy_state_does_not_inject_background_generation(self):
+        probes = 0
+
+        async def probe():
+            nonlocal probes
+            probes += 1
+
+        async def idle():
+            return True
+
+        watchdog = BackendWatchdog(self.policy(probe_interval_seconds=0.005), probe=probe, idle=idle)
+        await watchdog.report_success()
+        task = asyncio.create_task(watchdog.run())
+        await asyncio.sleep(0.02)
+        await watchdog.stop()
+        await task
+        self.assertEqual(0, probes)
 
     def test_invalid_policy_fails_loudly(self):
         with self.assertRaises(HealthControlError):
