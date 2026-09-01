@@ -340,7 +340,8 @@ class BackendWatchdog:
             self._last_error = message
             if immediate or self._consecutive_failures >= self.policy.failure_threshold:
                 self._state = BackendState.DEGRADED
-                self._wake.set()
+                if previous_state not in {BackendState.DEGRADED, BackendState.RECOVERING}:
+                    self._wake.set()
             elif previous_state == BackendState.STARTING:
                 self._state = BackendState.STARTING
             elif previous_state != BackendState.RECOVERING:
@@ -439,6 +440,8 @@ class BackendWatchdog:
                     snapshot = await self.snapshot()
                     if snapshot.state == BackendState.DEGRADED:
                         await self._wait(self.policy.restart_cooldown_seconds)
+                        if self._stop.is_set():
+                            continue
                         if await self._idle():
                             try:
                                 await self._verify()
