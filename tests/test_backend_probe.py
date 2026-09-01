@@ -15,6 +15,7 @@ class BackendProbeTests(unittest.IsolatedAsyncioTestCase):
             payload = json.loads(request.content)
             self.assertEqual(payload["model"], "local-model")
             self.assertFalse(payload["stream"])
+            self.assertEqual(payload["temperature"], 0)
             return httpx.Response(
                 200,
                 json={"choices": [{"message": {"content": "PONG"}}]},
@@ -28,6 +29,30 @@ class BackendProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.healthy)
         self.assertEqual(result.response_text, "PONG")
         self.assertIsNone(result.error_class)
+
+    async def test_provider_base_url_with_v1_is_not_duplicated_and_auth_is_forwarded(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, "/v1/chat/completions")
+            self.assertEqual(request.headers["Authorization"], "Bearer local-secret")
+            self.assertEqual(request.headers["X-Test"], "yes")
+            self.assertEqual(request.url.params["slot"], "0")
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "PONG"}}]},
+            )
+
+        result = await probe_generation(
+            BackendProbeConfig(
+                base_url="http://backend/v1",
+                model="local-model",
+                api_key="local-secret",
+                extra_headers={"X-Test": "yes"},
+                extra_query={"slot": 0},
+            ),
+            transport=httpx.MockTransport(handler),
+        )
+
+        self.assertTrue(result.healthy)
 
     async def test_generation_probe_rejects_shallow_but_invalid_response(self) -> None:
         async def handler(_: httpx.Request) -> httpx.Response:
