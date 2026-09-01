@@ -45,13 +45,13 @@ class BackendWatchdogTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await watchdog.initialize()
-        self.assertEqual(admissions, [])
+        self.assertEqual(admissions, [False])
         self.assertFalse(watchdog.snapshot().accepting)
 
         snapshot = await watchdog.tick()
         self.assertEqual(snapshot.state, WatchdogState.HEALTHY)
         self.assertTrue(snapshot.accepting)
-        self.assertEqual(admissions, [True])
+        self.assertEqual(admissions, [False, True])
 
     async def test_single_failure_after_healthy_is_suspect_without_restart(self) -> None:
         admissions: list[bool] = []
