@@ -4,13 +4,12 @@ from datetime import datetime, timezone
 import json
 import logging
 import math
+import re
 from typing import Any, Mapping
 
 
 EVENT_LOGGER_NAME = "llmcord.events"
 
-# These fields must never be emitted verbatim. Keep this list explicit so metric names such
-# as input_tokens/output_tokens remain valid while secrets and user-provided bodies are redacted.
 _SENSITIVE_KEYS = {
     "api_key",
     "authorization",
@@ -26,16 +25,30 @@ _SENSITIVE_KEYS = {
 }
 _REDACTED = "[REDACTED]"
 
-
-def _event_logger() -> logging.Logger:
-    logger = logging.getLogger(EVENT_LOGGER_NAME)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
-    return logger
+_REQUEST_ID_RE = re.compile(r"\brequest_id=([^\s]+)")
+_RECEIVED_RE = re.compile(
+    r"request_id=(?P<request_id>\S+) Message received \(user ID: \d+, attachments: (?P<attachments>\d+), conversation length: (?P<conversation>\d+)\):(?:\n.*)?$",
+    re.DOTALL,
+)
+_ADMITTED_RE = re.compile(r"request_id=(?P<request_id>\S+) inference admitted queue_wait_seconds=(?P<wait>[0-9.]+)")
+_BACKEND_UNAVAILABLE_RE = re.compile(
+    r"request_id=(?P<request_id>\S+) backend unavailable state=(?P<state>\S+) failures=(?P<failures>\S+)"
+)
+_GENERATION_TIMEOUT_RE = re.compile(r"request_id=(?P<request_id>\S+) Generation timeout phase=(?P<phase>\S+)")
+_CONTEXT_COMPACTED_RE = re.compile(
+    r"Context compacted \(input tokens: (?P<before>\d+) -> (?P<after>\d+), current input compacted: (?P<current>True|False)\)"
+)
+_WATCHDOG_FAILURE_RE = re.compile(
+    r"backend health failure state=(?P<state>\S+) count=(?P<count>\d+) threshold=(?P<threshold>\d+) error=(?P<error>.*)"
+)
+_WATCHDOG_RESTART_RE = re.compile(r"backend recovery restart attempt=(?P<attempt>\d+)")
+_WATCHDOG_RECOVERED_RE = re.compile(r"backend recovery succeeded attempt=(?P<attempt>\d+)")
+_PROBE_RE = re.compile(r"watchdog synthetic probe healthy latency_seconds=(?P<latency>[0-9.]+)")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(authorization|api_key|bot_token|discord_bot_token)\s*[=:]\s*([^\s,;]+)"
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_SK_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 
 
 def _sanitize_scalar(value: Any) -> Any:
@@ -61,6 +74,13 @@ def sanitize_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
+def redact_message(message: str) -> str:
+    message = _SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}={_REDACTED}", message)
+    message = _BEARER_RE.sub(f"Bearer {_REDACTED}", message)
+    message = _SK_RE.sub(_REDACTED, message)
+    return message
+
+
 def build_event(
     event: str,
     *,
@@ -83,13 +103,129 @@ def build_event(
     return payload
 
 
+def _request_id_from(message: str) -> str | None:
+    match = _REQUEST_ID_RE.search(message)
+    return match.group(1) if match else None
+
+
+def classify_message(message: str, *, level: str, logger_name: str) -> dict[str, Any]:
+    if message.startswith("structured_event="):
+        try:
+            raw = json.loads(message.removeprefix("structured_event="))
+            if not isinstance(raw, dict) or not raw.get("event"):
+                raise ValueError("structured event must be an object with event")
+            return sanitize_fields(raw)
+        except (json.JSONDecodeError, ValueError):
+            return build_event("observability.invalid_structured_event", logger=logger_name, level=level)
+
+    if match := _RECEIVED_RE.fullmatch(message):
+        return build_event(
+            "request.received",
+            request_id=match.group("request_id"),
+            attachments=int(match.group("attachments")),
+            conversation_messages=int(match.group("conversation")),
+        )
+    if match := _ADMITTED_RE.fullmatch(message):
+        return build_event(
+            "queue.admitted",
+            request_id=match.group("request_id"),
+            queue_wait_seconds=float(match.group("wait")),
+        )
+    if "inference queue full" in message:
+        return build_event("queue.rejected", request_id=_request_id_from(message), reason="queue_full")
+    if "inference queue wait timed out" in message:
+        return build_event("queue.timeout", request_id=_request_id_from(message), reason="queue_wait")
+    if match := _BACKEND_UNAVAILABLE_RE.fullmatch(message):
+        failures = match.group("failures")
+        return build_event(
+            "request.rejected",
+            request_id=match.group("request_id"),
+            reason="backend_unavailable",
+            backend_state=match.group("state"),
+            consecutive_failures=int(failures) if failures.isdigit() else failures,
+        )
+    if match := _CONTEXT_COMPACTED_RE.fullmatch(message):
+        return build_event(
+            "context.compacted",
+            input_tokens_before=int(match.group("before")),
+            input_tokens_after=int(match.group("after")),
+            current_input_compacted=match.group("current") == "True",
+        )
+    if match := _GENERATION_TIMEOUT_RE.fullmatch(message):
+        return build_event(
+            "generation.timeout",
+            request_id=match.group("request_id"),
+            phase=match.group("phase"),
+        )
+    if "Generation stream ended before a usable response" in message:
+        return build_event("generation.failure", request_id=_request_id_from(message), error_class="protocol_error")
+    if "Backend API error while generating response" in message:
+        return build_event("generation.failure", request_id=_request_id_from(message), error_class="backend_api_error")
+    if match := _WATCHDOG_FAILURE_RE.fullmatch(message):
+        return build_event(
+            "watchdog.failure",
+            backend_state=match.group("state"),
+            consecutive_failures=int(match.group("count")),
+            failure_threshold=int(match.group("threshold")),
+            error_class="backend_health_failure",
+        )
+    if match := _WATCHDOG_RESTART_RE.fullmatch(message):
+        return build_event("watchdog.restart", attempt=int(match.group("attempt")))
+    if match := _WATCHDOG_RECOVERED_RE.fullmatch(message):
+        return build_event("watchdog.recovered", attempt=int(match.group("attempt")))
+    if match := _PROBE_RE.fullmatch(message):
+        return build_event("probe.success", latency_seconds=float(match.group("latency")))
+
+    return build_event(
+        "log",
+        request_id=_request_id_from(message),
+        level=level,
+        logger=logger_name,
+        message=redact_message(message),
+    )
+
+
+class StructuredJsonFormatter(logging.Formatter):
+    def __init__(self, *, static_fields: Mapping[str, Any] | None = None) -> None:
+        super().__init__()
+        self.static_fields = sanitize_fields(static_fields or {})
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            payload = classify_message(record.getMessage(), level=record.levelname, logger_name=record.name)
+            for key, value in self.static_fields.items():
+                payload.setdefault(key, value)
+            return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        except Exception as exc:
+            fallback = build_event(
+                "observability.error",
+                error_class=type(exc).__name__,
+                logger=record.name,
+                level=record.levelname,
+            )
+            return json.dumps(fallback, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def install_structured_logging(*, provider: str | None = None, model: str | None = None) -> None:
+    root = logging.getLogger()
+    root.handlers.clear()
+    handler = logging.StreamHandler()
+    static_fields = {key: value for key, value in {"provider": provider, "model": model}.items() if value is not None}
+    handler.setFormatter(StructuredJsonFormatter(static_fields=static_fields))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
 def emit_event(event: str, *, request_id: str | None = None, **fields: Any) -> None:
-    """Emit one JSON object without allowing observability failures to break request handling."""
+    """Emit one event without allowing observability failures to break request handling."""
 
     try:
         payload = build_event(event, request_id=request_id, **fields)
-        _event_logger().info(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
-    except Exception as exc:  # observability must not become a new availability dependency
+        logging.getLogger(EVENT_LOGGER_NAME).info(
+            "structured_event=%s",
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        )
+    except Exception as exc:
         logging.getLogger(__name__).error(
             "structured observability emission failed event=%s error_class=%s",
             event if isinstance(event, str) else "invalid",
