@@ -123,7 +123,11 @@ class ProductionContract:
     artifact_path: str
 
 
-def validate_production_contract(config: Mapping[str, Any]) -> ProductionContract | None:
+def validate_production_contract(
+    config: Mapping[str, Any],
+    *,
+    verify_artifact: bool = True,
+) -> ProductionContract | None:
     production = config.get("production")
     if production is None:
         return None
@@ -148,7 +152,7 @@ def validate_production_contract(config: Mapping[str, Any]) -> ProductionContrac
     model = _required_text(production, "model", "production")
     if "/" not in model:
         raise ProductionContractError("production.model must use <provider>/<model> form")
-    provider_name, model_alias = model.removesuffix(":vision").split("/", 1)
+    provider_name, _ = model.removesuffix(":vision").split("/", 1)
     if provider_name != backend:
         raise ProductionContractError("production.backend must equal the provider prefix of production.model")
 
@@ -266,7 +270,8 @@ def validate_production_contract(config: Mapping[str, Any]) -> ProductionContrac
         gpu_process_name_pattern=gpu_process_name_pattern,
         artifact_path=artifact_path,
     )
-    verify_model_artifact(contract)
+    if verify_artifact:
+        verify_model_artifact(contract)
     return contract
 
 
